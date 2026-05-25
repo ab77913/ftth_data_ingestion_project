@@ -134,3 +134,50 @@ class DispatchQueue(Base):
         onupdate=datetime.utcnow,
         nullable=False,
     )
+
+
+class AgentTable(Base):
+    """Registry of agent teams and their per-field color rules for map visualisation."""
+
+    __tablename__ = "agent_tables"
+    __table_args__ = (UniqueConstraint("agent_name", name="uq_agent_tables_name"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    agent_name: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+    display_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    owner: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # color_rules: [{"field":"status","value":"qualified","color":"#22c55e","label":"Qualified"}, ...]
+    color_rules: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+    results: Mapped[list["AgentResult"]] = relationship(
+        back_populates="agent_table", cascade="all, delete-orphan"
+    )
+
+
+class AgentResult(Base):
+    """Stores one agent team's processed output per address record."""
+
+    __tablename__ = "agent_results"
+    __table_args__ = (
+        UniqueConstraint("agent_name", "address_id", name="uq_agent_results_agent_address"),
+        Index("ix_agent_results_agent_name", "agent_name"),
+        Index("ix_agent_results_job_id", "job_id"),
+        Index("ix_agent_results_address_id", "address_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    agent_name: Mapped[str] = mapped_column(
+        String(100), ForeignKey("agent_tables.agent_name", ondelete="CASCADE"), nullable=False
+    )
+    job_id: Mapped[object] = mapped_column(UUID(as_uuid=True), ForeignKey("ingestion_jobs.id"), nullable=False)
+    address_id: Mapped[int] = mapped_column(Integer, ForeignKey("addresses.id"), nullable=False)
+    data: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+    agent_table: Mapped["AgentTable"] = relationship(back_populates="results")

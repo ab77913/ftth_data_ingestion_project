@@ -44,14 +44,41 @@
     // ─── API Layer ──────────────────────────────────────────────────────────
     const API = '/api';
 
+    // ─── Auth helpers ────────────────────────────────────────────────────────
+    function getToken() { return sessionStorage.getItem('ftth_token'); }
+    function setToken(t) { sessionStorage.setItem('ftth_token', t); }
+    function clearToken() { sessionStorage.removeItem('ftth_token'); sessionStorage.removeItem('ftth_user'); }
+    function getUser() { return sessionStorage.getItem('ftth_user'); }
+    function authHeaders() { return { Authorization: `Bearer ${getToken()}` }; }
+
+    // Global fetch wrapper — intercepts 401 responses and dispatches an auto-logout event
+    async function apiFetch(url, options = {}) {
+      const res = await fetch(url, options);
+      if (res.status === 401) {
+        clearToken();
+        window.dispatchEvent(new CustomEvent('ftth-unauthorized'));
+      }
+      return res;
+    }
+
+    async function apiLogin(username, password) {
+      const res = await fetch(`${API}/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+      });
+      if (!res.ok) { const e = await res.json(); throw new Error(e.detail || 'Login failed'); }
+      return res.json();
+    }
+
     async function fetchJobs() {
-      const res = await fetch(`${API}/jobs`);
+      const res = await apiFetch(`${API}/jobs`, { headers: authHeaders() });
       if (!res.ok) throw new Error('Failed to fetch jobs');
       return res.json();
     }
 
     async function fetchJob(jobId) {
-      const res = await fetch(`${API}/jobs/${jobId}`);
+      const res = await apiFetch(`${API}/jobs/${jobId}`, { headers: authHeaders() });
       if (!res.ok) throw new Error('Failed to fetch job');
       return res.json();
     }
@@ -59,29 +86,30 @@
     async function uploadFile(file, customerId = 'demo_customer') {
       const formData = new FormData();
       formData.append('file', file);
-      const res = await fetch(`${API}/upload?customer_id=${encodeURIComponent(customerId)}`, {
-        method: 'POST', body: formData,
+      const res = await apiFetch(`${API}/upload?customer_id=${encodeURIComponent(customerId)}`, {
+        method: 'POST', body: formData, headers: authHeaders(),
       });
       if (!res.ok) { const err = await res.json(); throw new Error(err.detail || 'Upload failed'); }
       return res.json();
     }
 
     async function startProcessing(jobId) {
-      const res = await fetch(`${API}/jobs/${jobId}/process`, { method: 'POST' });
+      const res = await apiFetch(`${API}/jobs/${jobId}/process`, { method: 'POST', headers: authHeaders() });
       if (!res.ok) throw new Error('Failed to start processing');
       return res.json();
     }
 
     async function fetchAgentStatus(jobId) {
-      const res = await fetch(`${API}/jobs/${jobId}/agents`);
+      const res = await apiFetch(`${API}/jobs/${jobId}/agents`, { headers: authHeaders() });
       if (!res.ok) throw new Error('Failed to fetch agent status');
       return res.json();
     }
 
-    async function fetchRecords(jobId, page = 1, pageSize = 25) {
+    async function fetchRecords(jobId, page = 1, pageSize = 25, search = '') {
       const params = new URLSearchParams({ page, page_size: pageSize });
       if (jobId) params.append('job_id', jobId);
-      const res = await fetch(`${API}/records?${params}`);
+      if (search) params.append('search', search);
+      const res = await apiFetch(`${API}/records?${params}`, { headers: authHeaders() });
       if (!res.ok) throw new Error('Failed to fetch records');
       return res.json();
     }
@@ -89,13 +117,25 @@
     async function fetchGeoRecords(jobId) {
       const params = new URLSearchParams({ limit: '5000' });
       if (jobId) params.append('job_id', jobId);
-      const res = await fetch(`${API}/records/geo?${params}`);
+      const res = await apiFetch(`${API}/records/geo?${params}`, { headers: authHeaders() });
       if (!res.ok) throw new Error('Failed to fetch geo records');
       return res.json();
     }
 
+    async function fetchAgentTables() {
+      const res = await apiFetch(`${API}/agent/tables`, { headers: authHeaders() });
+      if (!res.ok) return [];
+      return res.json();
+    }
+
+    async function fetchMapOverlay(jobId) {
+      const res = await apiFetch(`${API}/map/overlay?job_id=${jobId}`, { headers: authHeaders() });
+      if (!res.ok) return { overlay: {}, legend: [] };
+      return res.json();
+    }
+
     function subscribeProgress(jobId, onMessage) {
-      const evtSource = new EventSource(`${API}/jobs/${jobId}/progress`);
+      const evtSource = new EventSource(`${API}/jobs/${jobId}/progress?token=${getToken()}`);
       evtSource.onmessage = (event) => {
         const data = JSON.parse(event.data);
         onMessage(data);
@@ -204,18 +244,21 @@
       const [customerId, setCustomerId] = useState('demo_customer');
       const [uploading, setUploading] = useState(false);
       const [dragOver, setDragOver] = useState(false);
+      const [error, setError] = useState(null);
       const inputRef = useRef(null);
 
       function handleDrop(e) {
         e.preventDefault(); setDragOver(false);
         const f = e.dataTransfer.files[0];
-        if (f) setFile(f);
+        if (f) { setFile(f); setError(null); }
       }
 
       async function handleSubmit() {
         if (!file) return;
         setUploading(true);
+        setError(null);
         try { await onUpload(file, customerId); }
+        catch (err) { setError(err.message || 'Upload failed. Please try again.'); }
         finally { setUploading(false); }
       }
 
@@ -240,18 +283,23 @@
               ) : (
                 <>
                   <p className="text-2xl mb-2">📁</p>
-                  <p className="text-gray-300">Drop CSV, Excel, KML, or KMZ here</p>
+                  <p className="text-gray-300">Drop CSV, Excel, KML, KMZ, or ZIP here</p>
                   <p className="text-gray-500 text-sm mt-1">or click to browse</p>
                 </>
               )}
-              <input ref={inputRef} type="file" accept=".csv,.xlsx,.xls,.kml,.kmz" className="hidden"
-                onChange={(e) => setFile(e.target.files[0])} />
+              <input ref={inputRef} type="file" accept=".csv,.xlsx,.xls,.kml,.kmz,.zip" className="hidden"
+                onChange={(e) => { setFile(e.target.files[0]); setError(null); }} />
             </div>
             <div className="mt-4">
               <label className="block text-sm text-gray-400 mb-1">Customer ID</label>
               <input type="text" value={customerId} onChange={(e) => setCustomerId(e.target.value)}
                 className="w-full bg-dark-700 border border-dark-600 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-blue-500" />
             </div>
+            {error && (
+              <div className="mt-3 p-3 bg-red-900/50 border border-red-700 rounded-lg text-red-300 text-sm">
+                {error}
+              </div>
+            )}
             <button onClick={handleSubmit} disabled={!file || uploading}
               className="w-full mt-5 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-700 disabled:text-gray-500 text-white py-2.5 rounded-lg font-medium">
               {uploading ? 'Uploading & Processing...' : 'Upload & Start Processing'}
@@ -261,16 +309,24 @@
       );
     }
 
-    function RecordsTable({ jobId }) {
+    function RecordsTable({ jobId, navigate }) {
       const [data, setData] = useState(null);
       const [page, setPage] = useState(1);
       const [loading, setLoading] = useState(true);
+      const [searchInput, setSearchInput] = useState('');
+      const [search, setSearch] = useState('');
 
-      useEffect(() => { loadRecords(); }, [jobId, page]);
+      // Debounce search — fires fresh API fetch 400ms after user stops typing
+      useEffect(() => {
+        const t = setTimeout(() => { setSearch(searchInput); setPage(1); }, 400);
+        return () => clearTimeout(t);
+      }, [searchInput]);
+
+      useEffect(() => { loadRecords(); }, [jobId, page, search]);
 
       async function loadRecords() {
         setLoading(true);
-        try { setData(await fetchRecords(jobId, page, 25)); }
+        try { setData(await fetchRecords(jobId, page, 25, search)); }
         catch (err) { console.error(err); }
         finally { setLoading(false); }
       }
@@ -279,6 +335,7 @@
       if (!data || data.records.length === 0) return <div className="text-center py-8 text-gray-500">No records found</div>;
 
       const columns = data.columns || [];
+      const hasGeo = data.records.some(r => r.latitude && r.longitude);
 
       function getCellValue(record, col) {
         if (col.source === 'raw' && record.raw_data) return record.raw_data[col.key] ?? '';
@@ -289,37 +346,83 @@
 
       return (
         <div>
-          <div className="overflow-x-auto">
-            <table className="w-full text-xs">
+          {/* Toolbar */}
+          <div className="flex items-center justify-between mb-3 gap-3 flex-wrap">
+            <div className="flex items-center gap-3">
+              <span className="text-xs text-gray-400 font-mono bg-dark-700 px-2 py-1 rounded">
+                {columns.length} cols &middot; {data.total} rows
+              </span>
+              {hasGeo && navigate && (
+                <button onClick={() => navigate(`/projects/${jobId}/map`)}
+                  className="flex items-center gap-1 text-xs bg-blue-600 hover:bg-blue-700 px-3 py-1.5 rounded font-medium">
+                  🗺 View on Map
+                </button>
+              )}
+            </div>
+            <input type="text" placeholder="Search all records…" value={searchInput}
+              onChange={e => setSearchInput(e.target.value)}
+              className="px-3 py-1.5 bg-dark-700 border border-dark-600 rounded text-xs text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 w-60" />
+          </div>
+
+          {/* Table — horizontally scrollable, shows every column from the source file */}
+          <div className="overflow-x-auto rounded-lg border border-dark-600">
+            <table className="text-xs border-collapse" style={{minWidth:'max-content'}}>
               <thead>
-                <tr className="border-b border-dark-600">
-                  {columns.slice(0, 10).map(col => (
-                    <th key={col.key} className="text-left px-3 py-2 text-gray-400 font-medium whitespace-nowrap">{col.label}</th>
+                <tr className="bg-dark-700">
+                  {columns.map(col => (
+                    <th key={col.key}
+                      className="text-left px-3 py-2.5 text-gray-300 font-semibold whitespace-nowrap border-b border-dark-600 border-r border-dark-700 last:border-r-0"
+                      style={{position:'sticky', top:0, zIndex:10, background:'#252832'}}>
+                      {col.label}
+                    </th>
                   ))}
+                  {hasGeo && (
+                    <th className="text-center px-3 py-2.5 text-gray-300 font-semibold whitespace-nowrap border-b border-dark-600"
+                      style={{position:'sticky', top:0, zIndex:10, background:'#252832'}}>Map</th>
+                  )}
                 </tr>
               </thead>
               <tbody>
                 {data.records.map(record => (
-                  <tr key={record.id} className="border-b border-dark-700 hover:bg-dark-700">
-                    {columns.slice(0, 10).map(col => {
+                  <tr key={record.id} className="border-b border-dark-700 hover:bg-dark-700/60 transition-colors">
+                    {columns.map(col => {
                       const value = getCellValue(record, col);
                       const missing = isMissing(value);
+                      const str = missing ? '' : String(value);
                       return (
-                        <td key={col.key} className={`px-3 py-2 whitespace-nowrap ${missing ? 'bg-red-500/10 text-red-400 italic' : 'text-gray-300'}`}>
-                          {missing ? '—' : String(value).slice(0, 40)}
+                        <td key={col.key}
+                          className={`px-3 py-1.5 border-r border-dark-700/50 last:border-r-0 ${
+                            missing ? 'text-red-400/60 italic' : 'text-gray-300'
+                          }`}
+                          style={{maxWidth:'220px', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap'}}
+                          title={str || undefined}>
+                          {missing ? '—' : str}
                         </td>
                       );
                     })}
+                    {hasGeo && (
+                      <td className="px-3 py-1.5 text-center border-l border-dark-700">
+                        {(record.latitude && record.longitude) ? (
+                          <a href={`https://www.google.com/maps?q=${record.latitude},${record.longitude}`}
+                            target="_blank" rel="noopener noreferrer"
+                            title={`Open ${Number(record.latitude).toFixed(5)}, ${Number(record.longitude).toFixed(5)} in Google Maps`}
+                            className="text-blue-400 hover:text-blue-300 text-sm">📍</a>
+                        ) : <span className="text-gray-700 text-xs">—</span>}
+                      </td>
+                    )}
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
+
+          {/* Pagination */}
           <div className="flex items-center justify-between mt-4 pt-4 border-t border-dark-600">
-            <span className="text-xs text-gray-500">Page {data.page} of {data.total_pages} ({data.total} records)</span>
+            <span className="text-xs text-gray-500">Page {data.page} of {data.total_pages} &middot; {data.total} records total{search ? ` matching "${search}"` : ''}</span>
             <div className="flex items-center gap-2">
               <button onClick={() => setPage(p => Math.max(1, p - 1))} disabled={page <= 1}
                 className="px-2 py-1 text-xs hover:bg-dark-600 rounded disabled:opacity-30">‹ Prev</button>
+              <span className="text-xs text-gray-500 font-mono px-1">{page} / {data.total_pages}</span>
               <button onClick={() => setPage(p => Math.min(data.total_pages, p + 1))} disabled={page >= data.total_pages}
                 className="px-2 py-1 text-xs hover:bg-dark-600 rounded disabled:opacity-30">Next ›</button>
             </div>
@@ -639,7 +742,7 @@
           {/* Records */}
           <div className="bg-dark-800 border border-dark-600 rounded-xl p-5">
             <h2 className="font-semibold mb-4">Data Records</h2>
-            <RecordsTable jobId={jobId} />
+            <RecordsTable jobId={jobId} navigate={navigate} />
           </div>
         </div>
       );
@@ -651,7 +754,12 @@
       const [agentStatus, setAgentStatus] = useState(null);
       const [loading, setLoading] = useState(true);
       const [isFullscreen, setIsFullscreen] = useState(false);
-      const [selectedPoint, setSelectedPoint] = useState(null); // {lat, lon, name}
+      const [selectedPoint, setSelectedPoint] = useState(null);
+      const [colorMode, setColorMode] = useState('kmz'); // 'kmz' | 'agent'
+      const [overlay, setOverlay] = useState({ overlay: {}, legend: [] });
+      const [activeFilter, setActiveFilter] = useState(null); // legend label | null = show all
+      const [svFullscreen, setSvFullscreen] = useState(false);
+      const activeFilterRef = useRef(null); // always holds latest filter; avoids stale closures
       const mapRef = useRef(null);
       const mapInstanceRef = useRef(null);
       const markersLayerRef = useRef(null);
@@ -676,8 +784,10 @@
 
       async function loadData() {
         try {
-          const [jobData, status] = await Promise.all([fetchJob(jobId), fetchAgentStatus(jobId)]);
-          setJob(jobData); setAgentStatus(status);
+          const [jobData, status, ov] = await Promise.all([
+            fetchJob(jobId), fetchAgentStatus(jobId), fetchMapOverlay(jobId)
+          ]);
+          setJob(jobData); setAgentStatus(status); setOverlay(ov);
           await loadGeoData();
         } catch (err) { console.error(err); }
         finally { setLoading(false); }
@@ -685,9 +795,10 @@
 
       async function loadGeoData() {
         try {
-          const data = await fetchGeoRecords(jobId);
+          const [data, ov] = await Promise.all([fetchGeoRecords(jobId), fetchMapOverlay(jobId)]);
           setFeatures(data.features || []);
-          updateMap(data.features || []);
+          setOverlay(ov);
+          updateMap(data.features || [], ov);
         } catch (err) { console.error(err); }
       }
 
@@ -773,21 +884,50 @@
         new StreetViewControl().addTo(map);
 
         mapInstanceRef.current = map;
-        if (features.length > 0) updateMap(features);
+        if (features.length > 0) updateMap(features, overlay);
         return () => { if (mapInstanceRef.current) { mapInstanceRef.current.remove(); mapInstanceRef.current = null; } };
       }, [loading]);
+
+      // Keep ref in sync so updateMap always reads latest filter even from old closures
+      useEffect(() => { activeFilterRef.current = activeFilter; }, [activeFilter]);
+
+      // Reset active filter when color mode changes
+      useEffect(() => { setActiveFilter(null); activeFilterRef.current = null; }, [colorMode]);
+
+      // Re-render map when color mode, overlay, or filter changes
+      useEffect(() => {
+        if (features.length > 0 && mapInstanceRef.current) updateMap(features, overlay);
+      }, [colorMode, overlay, activeFilter]);
+
+      // Auto-load Street View with the first available Point when data arrives
+      useEffect(() => {
+        if (features.length > 0 && !selectedPoint) {
+          const fp = features.find(f => f.geometry_type === 'Point' && f.lat && f.lon) || features.find(f => f.lat && f.lon);
+          if (fp) setSelectedPoint({ lat: fp.lat, lon: fp.lon, name: fp.display_name || fp.address || `${fp.lat.toFixed(5)}, ${fp.lon.toFixed(5)}` });
+        }
+      }, [features]);
 
       // Handle fullscreen resize
       useEffect(() => {
         if (mapInstanceRef.current) {
           setTimeout(() => mapInstanceRef.current.invalidateSize(), 100);
         }
-      }, [isFullscreen, selectedPoint]);
+      }, [isFullscreen, svFullscreen]);
 
-      function updateMap(feats) {
+      // Refit map when split-screen opens/closes (selectedPoint changes)
+      useEffect(() => {
+        if (mapInstanceRef.current) {
+          setTimeout(() => mapInstanceRef.current.invalidateSize(), 350);
+        }
+      }, [selectedPoint]);
+
+      function updateMap(feats, ovData) {
         if (!mapInstanceRef.current || !markersLayerRef.current) return;
         markersLayerRef.current.clearLayers();
         const bounds = [];
+
+        const ovMap = (ovData && ovData.overlay) ? ovData.overlay : {};
+        const useAgentColors = colorMode === 'agent' && Object.keys(ovMap).length > 0;
 
         // KMZ-style color palette for categories/folders
         const categoryColors = {};
@@ -795,16 +935,28 @@
         let colorIdx = 0;
 
         feats.forEach(feat => {
-          // Assign consistent color per category/folder (like KMZ)
           const catKey = feat.category || feat.folder_path || 'default';
           if (!categoryColors[catKey]) {
             categoryColors[catKey] = feat.style_color || palette[colorIdx % palette.length];
             colorIdx++;
           }
-          const featureColor = categoryColors[catKey];
+
+          // Apply legend filter — skip features that don't match the active filter
+          // Read from ref so this works correctly even when called from a stale closure
+          const currentFilter = activeFilterRef.current;
+          if (currentFilter) {
+            const agentOvForFilter = useAgentColors ? ovMap[feat.id] : null;
+            const filterKey = colorMode === 'agent'
+              ? (agentOvForFilter ? agentOvForFilter.label : null)
+              : catKey;
+            if (filterKey !== currentFilter) return;
+          }
+
+          // Choose color: agent overlay takes priority when in agent mode
+          const agentOv = useAgentColors ? ovMap[feat.id] : null;
+          const featureColor = agentOv ? agentOv.color : categoryColors[catKey];
           const displayName = feat.placemark_name || feat.address || feat.category || '';
 
-          // Draw polygons (KMZ style - filled with transparency)
           if (feat.coordinates && feat.geometry_type === 'Polygon') {
             try {
               const polygon = L.polygon(
@@ -825,7 +977,6 @@
             return;
           }
 
-          // Draw linestrings (KMZ style - colored paths for fiber routes)
           if (feat.coordinates && feat.geometry_type === 'LineString') {
             try {
               const polyline = L.polyline(
@@ -845,26 +996,32 @@
             return;
           }
 
-          // Draw point markers (KMZ style pins)
           if (feat.lat && feat.lon) {
+            const dotSize = agentOv ? '12px' : '10px';
+            const border = agentOv ? '2.5px solid #fff' : '2px solid #fff';
             const icon = L.divIcon({
               className: 'custom-pin',
-              html: '<div style="width:10px;height:10px;border-radius:50%;background:' + featureColor + ';border:2px solid #fff;box-shadow:0 2px 4px rgba(0,0,0,0.5);"></div>',
-              iconSize: [10, 10],
-              iconAnchor: [5, 5],
+              html: '<div style="width:' + dotSize + ';height:' + dotSize + ';border-radius:50%;background:' + featureColor + ';border:' + border + ';box-shadow:0 2px 4px rgba(0,0,0,0.5);"></div>',
+              iconSize: [12, 12],
+              iconAnchor: [6, 6],
             });
-
+            const agentBits = agentOv
+              ? '<hr style="margin:4px 0;border-color:#444"/>' +
+                '<span style="color:' + agentOv.color + '">● ' + agentOv.label + '</span> <span style="color:#aaa;font-size:10px">(' + agentOv.agent + ')</span><br/>' +
+                Object.entries(agentOv.data || {}).slice(0, 6).map(([k,v]) => `<span style="color:#aaa">${k}:</span> ${v}`).join('<br/>')
+              : '';
             const marker = L.marker([feat.lat, feat.lon], { icon });
             marker.bindPopup(
               '<div style="font-size:12px;min-width:220px;">' +
               '<strong>' + (displayName || 'Point') + '</strong><br/>' +
-              (feat.category ? '<span style="color:' + featureColor + '">● ' + feat.category + '</span><br/>' : '') +
+              (feat.category ? '<span style="color:' + categoryColors[catKey] + '">● ' + feat.category + '</span><br/>' : '') +
               '<hr style="margin:4px 0;border-color:#ddd;"/>' +
               '📍 ' + feat.lat.toFixed(6) + ', ' + feat.lon.toFixed(6) + '<br/>' +
               (feat.network_node ? '🔗 Node: ' + feat.network_node + '<br/>' : '') +
               (feat.terminal_id ? '📦 Terminal: ' + feat.terminal_id + '<br/>' : '') +
               (feat.folder_path ? '📁 ' + feat.folder_path + '<br/>' : '') +
               (feat.address ? '🏠 ' + feat.address : '') +
+              agentBits +
               '</div>'
             );
             marker.on('click', () => {
@@ -883,19 +1040,45 @@
       const isProcessing = agentStatus?.status === 'processing';
       const totalWithCoords = features.length;
       const totalMissingData = features.filter(f => !f.address || !f.city || !f.state).length;
+      const hasAgentOverlay = overlay.legend && overlay.legend.length > 0;
 
-      // Build legend categories from features
-      const legendItems = {};
+      // Build KMZ legend categories from features
+      const kmzLegend = {};
       const palette = ['#FF4136','#0074D9','#2ECC40','#FF851B','#B10DC9','#FFDC00','#01FF70','#F012BE','#7FDBFF','#85144b'];
       let ci = 0;
       features.forEach(f => {
         const cat = f.category || f.folder_path || 'Other';
-        if (!legendItems[cat]) {
-          legendItems[cat] = { color: f.style_color || palette[ci % palette.length], count: 0, type: f.geometry_type || 'Point' };
+        if (!kmzLegend[cat]) {
+          kmzLegend[cat] = { color: f.style_color || palette[ci % palette.length], count: 0, type: f.geometry_type || 'Point' };
           ci++;
         }
-        legendItems[cat].count++;
+        kmzLegend[cat].count++;
       });
+
+      // Build agent legend: group by display_name
+      const agentLegend = {};
+      (overlay.legend || []).forEach(rule => {
+        if (!agentLegend[rule.display_name]) agentLegend[rule.display_name] = [];
+        agentLegend[rule.display_name].push(rule);
+      });
+
+      const legendItems = colorMode === 'agent' && hasAgentOverlay ? null : kmzLegend;
+
+      // All selectable filter labels with their colour for the dropdown
+      const filterOptions = colorMode === 'agent' && hasAgentOverlay
+        ? (overlay.legend || []).map(rule => ({ label: rule.label, color: rule.color }))
+        : Object.entries(kmzLegend).map(([cat, info]) => ({ label: cat, color: info.color }));
+
+      // Points visible after applying the active filter
+      const filteredCount = activeFilter
+        ? features.filter(f => {
+            if (colorMode === 'agent' && hasAgentOverlay) {
+              const ov = (overlay.overlay || {})[f.id];
+              return ov && ov.label === activeFilter;
+            }
+            return (f.category || f.folder_path || 'Other') === activeFilter;
+          }).length
+        : totalWithCoords;
 
       return (
         <div className={isFullscreen ? 'fixed inset-0 z-50 bg-dark-900 p-0' : ''}>
@@ -922,79 +1105,216 @@
                 className="flex items-center gap-1 text-xs bg-dark-700 hover:bg-dark-600 border border-dark-600 px-3 py-1.5 rounded">
                 {isFullscreen ? '⊡ Exit Fullscreen' : '⛶ Fullscreen'}
               </button>
+              {/* Color mode toggle */}
+              <div className="flex items-center bg-dark-700 border border-dark-600 rounded overflow-hidden text-xs">
+                <button onClick={() => setColorMode('kmz')}
+                  className={`px-3 py-1.5 transition ${colorMode==='kmz' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}`}>
+                  KMZ Colors
+                </button>
+                <button onClick={() => setColorMode('agent')}
+                  className={`px-3 py-1.5 transition ${colorMode==='agent' ? 'bg-green-600 text-white' : 'text-gray-400 hover:text-white'}`}
+                  title={hasAgentOverlay ? 'Color by agent outputs' : 'No agent outputs yet'}>
+                  Agent Colors {hasAgentOverlay ? `(${overlay.legend.length})` : ''}
+                </button>
+              </div>
+              {/* Export buttons */}
+              <a href={`${API}/export/csv?job_id=${jobId}`}
+                onClick={e => { e.preventDefault(); window.location = `${API}/export/csv?job_id=${jobId}&_t=${getToken()}`; }}
+                className="flex items-center gap-1 text-xs bg-dark-700 hover:bg-dark-600 border border-dark-600 px-3 py-1.5 rounded">
+                ⬇ CSV
+              </a>
+              <a href={`${API}/export/kmz?job_id=${jobId}`}
+                onClick={e => { e.preventDefault(); window.location = `${API}/export/kmz?job_id=${jobId}&_t=${getToken()}`; }}
+                className="flex items-center gap-1 text-xs bg-dark-700 hover:bg-dark-600 border border-dark-600 px-3 py-1.5 rounded">
+                ⬇ KMZ
+              </a>
+              {/* Legend filter dropdown */}
+              {filterOptions.length > 0 && (
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs text-gray-400 flex-shrink-0">🔍 Filter:</span>
+                  <div className="relative">
+                    <select
+                      value={activeFilter || ''}
+                      onChange={e => setActiveFilter(e.target.value || null)}
+                      className="appearance-none text-xs bg-dark-700 border border-dark-600 rounded px-2 pr-6 py-1.5 text-white focus:border-blue-500 outline-none cursor-pointer"
+                      style={{minWidth:'130px'}}>
+                      <option value="">All ({features.length} pts)</option>
+                      {filterOptions.map(opt => (
+                        <option key={opt.label} value={opt.label}>{opt.label}</option>
+                      ))}
+                    </select>
+                    <span className="pointer-events-none absolute right-1.5 top-1/2 -translate-y-1/2 text-gray-400 text-xs">▾</span>
+                  </div>
+                  {activeFilter && (
+                    <button onClick={() => setActiveFilter(null)}
+                      title="Show all"
+                      className="text-xs text-gray-400 hover:text-white flex-shrink-0 w-5 h-5 flex items-center justify-center rounded hover:bg-dark-600">✕</button>
+                  )}
+                </div>
+              )}
             </div>
           </div>
 
-          {/* Map + Street View split container */}
-          <div className={`flex ${isFullscreen ? 'h-screen w-full' : 'rounded-xl overflow-hidden border border-dark-600'}`}
+          {/* Map container — relative so legend + street view float inside */}
+          {/* When a point is selected: map shrinks left, street view expands right */}
+          <div className={`relative flex gap-0 ${isFullscreen ? 'h-screen w-full' : 'rounded-xl overflow-hidden border border-dark-600'}`}
             style={isFullscreen ? {} : {height:'calc(100vh - 140px)'}}>
-            
-            {/* Map panel */}
-            <div className="relative" style={{flex: selectedPoint ? '1 1 55%' : '1 1 100%', minWidth: 0}}>
-              <div ref={mapRef} style={{height:'100%',width:'100%'}} />
 
-              {/* Legend panel - bottom left overlay on map */}
-              <div className="absolute bottom-4 left-4 z-[1000] bg-dark-900/95 backdrop-blur border border-dark-600 rounded-lg p-3 max-h-64 overflow-y-auto" style={{minWidth:'180px'}}>
-                <h3 className="text-xs font-bold text-gray-300 uppercase tracking-wide mb-2">Legend</h3>
-                <div className="space-y-1.5">
-                  {Object.entries(legendItems).map(([cat, info]) => (
-                    <div key={cat} className="flex items-center gap-2">
-                      {info.type === 'LineString' ? (
-                        <div style={{width:'16px',height:'3px',background:info.color,borderRadius:'2px'}} />
-                      ) : info.type === 'Polygon' ? (
-                        <div style={{width:'12px',height:'12px',background:info.color,opacity:0.4,border:'2px solid '+info.color,borderRadius:'2px'}} />
-                      ) : (
-                        <div style={{width:'10px',height:'10px',borderRadius:'50%',background:info.color,border:'1.5px solid #fff'}} />
-                      )}
-                      <span className="text-xs text-gray-300 flex-1">{cat}</span>
-                      <span className="text-xs text-gray-500">{info.count}</span>
-                    </div>
-                  ))}
+            {/* Map canvas — shrinks when street view is open */}
+            <div ref={mapRef} style={{height:'100%', flex: (selectedPoint && !svFullscreen) ? '0 0 55%' : '1 1 100%', transition:'flex 0.3s ease'}} />
+
+            {/* Legend — floating bottom-left, click any item to filter the map */}
+            <div className="absolute bottom-4 left-4 z-[1000] bg-dark-900/95 backdrop-blur border border-dark-600 rounded-lg p-3 max-h-72 overflow-y-auto" style={{minWidth:'200px'}}>
+              {colorMode === 'agent' && hasAgentOverlay ? (
+                <>
+                  <div className="flex items-center justify-between mb-2">
+                    <h3 className="text-xs font-bold text-green-400 uppercase tracking-wide">Agent Legend</h3>
+                    {activeFilter && <span className="text-xs text-blue-400 font-semibold">filtered</span>}
+                  </div>
+                  {Object.entries(agentLegend).map(([agentDisplayName, rules]) => {
+                    const visRules = rules.filter(rule => !activeFilter || rule.label === activeFilter);
+                    if (visRules.length === 0) return null;
+                    return (
+                      <div key={agentDisplayName} className="mb-2">
+                        <div className="text-xs text-gray-400 font-semibold mb-1">{agentDisplayName}</div>
+                        {visRules.map((rule, i) => (
+                          <div key={i}
+                            className={`flex items-center gap-2 mb-0.5 cursor-pointer rounded px-1 -mx-1 py-0.5 transition-colors select-none ${
+                              activeFilter === rule.label ? 'bg-dark-600 ring-1 ring-blue-500/50' : 'hover:bg-dark-700/70'
+                            }`}
+                            onClick={() => setActiveFilter(activeFilter === rule.label ? null : rule.label)}>
+                            <div style={{width:'10px',height:'10px',borderRadius:'50%',background:rule.color,border:'1.5px solid #fff',flexShrink:0}} />
+                            <span className={`text-xs flex-1 ${activeFilter === rule.label ? 'text-white font-bold' : 'text-gray-300'}`}>{rule.label}</span>
+                            {activeFilter === rule.label && <span className="text-blue-400 text-xs flex-shrink-0">✓</span>}
+                          </div>
+                        ))}
+                      </div>
+                    );
+                  })}
+                  <hr className="border-dark-600 my-2" />
+                  <div className="text-xs text-gray-500">
+                    {activeFilter ? `Showing: ${filteredCount} pts` : `${Object.keys(overlay.overlay || {}).length} addresses have agent data`}
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="flex items-center justify-between mb-2">
+                    <h3 className="text-xs font-bold text-gray-300 uppercase tracking-wide">Legend</h3>
+                    {activeFilter && <span className="text-xs text-blue-400 font-semibold">filtered</span>}
+                  </div>
+                  <div className="space-y-0.5">
+                    {Object.entries(kmzLegend)
+                      .filter(([cat]) => !activeFilter || cat === activeFilter)
+                      .map(([cat, info]) => (
+                      <div key={cat}
+                        className={`flex items-center gap-2 cursor-pointer rounded px-1 -mx-1 py-0.5 transition-colors select-none ${
+                          activeFilter === cat ? 'bg-dark-600 ring-1 ring-blue-500/50' : 'hover:bg-dark-700/70'
+                        }`}
+                        onClick={() => setActiveFilter(activeFilter === cat ? null : cat)}>
+                        {info.type === 'LineString' ? (
+                          <div style={{width:'16px',height:'3px',background:info.color,borderRadius:'2px',flexShrink:0}} />
+                        ) : info.type === 'Polygon' ? (
+                          <div style={{width:'12px',height:'12px',background:info.color,opacity:0.4,border:'2px solid '+info.color,borderRadius:'2px',flexShrink:0}} />
+                        ) : (
+                          <div style={{width:'10px',height:'10px',borderRadius:'50%',background:info.color,border:'1.5px solid #fff',flexShrink:0}} />
+                        )}
+                        <span className={`text-xs flex-1 ${activeFilter === cat ? 'text-white font-bold' : 'text-gray-300'}`}>{cat}</span>
+                        <span className="text-xs text-gray-500">{info.count}</span>
+                        {activeFilter === cat && <span className="text-blue-400 text-xs flex-shrink-0">✓</span>}
+                      </div>
+                    ))}
+                  </div>
+                  <hr className="border-dark-600 my-2" />
+                  <div className="text-xs text-gray-400 space-y-0.5">
+                    <div>{activeFilter ? `Showing: ${filteredCount}` : `Total: ${totalWithCoords}`}</div>
+                    {!activeFilter && <div>Points: {features.filter(f=>f.geometry_type==='Point').length}</div>}
+                    {!activeFilter && <div>Lines: {features.filter(f=>f.geometry_type==='LineString').length}</div>}
+                    {!activeFilter && <div>Polygons: {features.filter(f=>f.geometry_type==='Polygon').length}</div>}
+                  </div>
+                </>
+              )}
+              {activeFilter && (
+                <div className="mt-2 pt-2 border-t border-dark-600">
+                  <button onClick={() => setActiveFilter(null)}
+                    className="w-full text-xs text-blue-400 hover:text-blue-300 flex items-center gap-1">
+                    <span>✕</span><span className="truncate"> Clear: "{activeFilter}"</span>
+                  </button>
                 </div>
-                <hr className="border-dark-600 my-2" />
-                <div className="text-xs text-gray-400 space-y-0.5">
-                  <div>Total features: {totalWithCoords}</div>
-                  <div>Points: {features.filter(f=>f.geometry_type==='Point').length}</div>
-                  <div>Lines: {features.filter(f=>f.geometry_type==='LineString').length}</div>
-                  <div>Polygons: {features.filter(f=>f.geometry_type==='Polygon').length}</div>
-                </div>
-              </div>
+              )}
             </div>
 
-            {/* Google Street View Panel */}
-            {selectedPoint && (
-              <div className="relative border-l border-dark-600 flex flex-col" style={{flex:'1 1 45%', minWidth:0}}>
-                {/* Street View Header */}
-                <div className="flex items-center justify-between bg-dark-800 px-3 py-2 border-b border-dark-600">
-                  <div className="flex items-center gap-2">
-                    <span className="text-yellow-400">🚶</span>
-                    <span className="text-xs font-semibold text-white">{selectedPoint.name}</span>
-                    <span className="text-xs text-gray-400">({selectedPoint.lat.toFixed(5)}, {selectedPoint.lon.toFixed(5)})</span>
-                  </div>
-                  <button onClick={() => setSelectedPoint(null)}
-                    className="text-gray-400 hover:text-white text-lg leading-none px-2">&times;</button>
+            {/* Street View — right side panel (split screen) or fullscreen overlay */}
+            <div
+              className={`flex flex-col bg-black border-l border-dark-600 transition-all duration-300 overflow-hidden ${
+                svFullscreen ? 'absolute inset-0 z-[2000] border-0' : ''
+              }`}
+              style={svFullscreen
+                ? {}
+                : selectedPoint
+                  ? {flex:'0 0 45%', minWidth:0}
+                  : {flex:'0 0 0%', minWidth:0}
+              }>
+
+              {/* Panel header */}
+              <div className="flex items-center gap-2 bg-dark-800 px-3 py-2 border-b border-dark-600 flex-shrink-0">
+                <span className="text-yellow-400 text-base flex-shrink-0">🚶</span>
+                <div className="flex-1 min-w-0">
+                  {selectedPoint ? (
+                    <>
+                      <div className="text-xs font-semibold text-white truncate">{selectedPoint.name}</div>
+                      <div className="text-xs text-gray-500">{selectedPoint.lat.toFixed(5)}, {selectedPoint.lon.toFixed(5)}</div>
+                    </>
+                  ) : (
+                    <div className="text-xs font-semibold text-gray-400">Street View</div>
+                  )}
                 </div>
-                {/* Google Maps Embed - Street View */}
-                <div className="flex-1 relative">
-                  <iframe
-                    className="absolute inset-0 w-full h-full"
-                    style={{border:0}}
-                    loading="lazy"
-                    allowFullScreen
-                    referrerPolicy="no-referrer-when-downgrade"
-                    src={`https://www.google.com/maps/embed?pb=!4v${Date.now()}!6m8!1m7!1s!2m2!1d${selectedPoint.lat}!2d${selectedPoint.lon}!3f0!4f0!5f0.7820865974627469`}
-                  />
-                  {/* Fallback: Google Maps link if embed doesn't load street view */}
-                  <div className="absolute bottom-3 right-3 z-10">
-                    <a href={`https://www.google.com/maps/@${selectedPoint.lat},${selectedPoint.lon},3a,75y,0h,90t/data=!3m6!1e1!3m4!1s!2e0!7i16384!8i8192`}
+                <div className="flex items-center gap-0.5 flex-shrink-0">
+                  <button
+                    onClick={() => setSvFullscreen(f => !f)}
+                    title={svFullscreen ? 'Exit fullscreen' : 'Fullscreen'}
+                    className="w-7 h-7 flex items-center justify-center hover:bg-dark-600 rounded text-gray-400 hover:text-white transition">
+                    {svFullscreen ? '⊡' : '⛶'}
+                  </button>
+                  {selectedPoint && (
+                    <a
+                      href={`https://www.google.com/maps/@${selectedPoint.lat},${selectedPoint.lon},3a,75y,0h,88t/data=!3m4!1e1`}
                       target="_blank" rel="noopener noreferrer"
-                      className="bg-dark-800/90 hover:bg-dark-700 text-xs text-white px-3 py-1.5 rounded border border-dark-600 flex items-center gap-1">
-                      🌐 Open in Google Maps
-                    </a>
-                  </div>
+                      title="Open full Street View in Google Maps"
+                      className="w-7 h-7 flex items-center justify-center hover:bg-dark-600 rounded text-gray-400 hover:text-blue-400 transition text-sm">🌐</a>
+                  )}
+                  {selectedPoint && (
+                    <button
+                      onClick={() => { setSelectedPoint(null); setSvFullscreen(false); }}
+                      title="Close"
+                      className="w-7 h-7 flex items-center justify-center hover:bg-dark-600 rounded text-gray-400 hover:text-red-400 transition font-bold text-base">&times;</button>
+                  )}
                 </div>
               </div>
-            )}
+
+              {/* Body — pure panorama iframe (Google Maps Embed "Share" format, no chrome) */}
+              <div className="flex-1 relative min-h-0">
+                {selectedPoint ? (
+                  <iframe
+                    key={`sv-${selectedPoint.lat.toFixed(6)}-${selectedPoint.lon.toFixed(6)}`}
+                    className="absolute inset-0 w-full h-full"
+                    style={{border:0}}
+                    loading="eager"
+                    allowFullScreen
+                    allow="fullscreen; geolocation; accelerometer; gyroscope"
+                    referrerPolicy="no-referrer-when-downgrade"
+                    src={`https://maps.google.com/maps?q=&layer=c&cbll=${selectedPoint.lat},${selectedPoint.lon}&cbp=12,0,0,0,0&output=embed`}
+                  />
+                ) : (
+                  <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 select-none">
+                    <span className="text-5xl opacity-20">🚶</span>
+                    <div className="text-center">
+                      <p className="text-sm text-gray-400 font-medium">Street View</p>
+                      <p className="text-xs text-gray-600 mt-1">Click any map point</p>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
           </div>
         </div>
       );
@@ -1002,22 +1322,97 @@
 
     // ─── App Root ───────────────────────────────────────────────────────────
 
+    function LoginPage({ onLogin }) {
+      const [username, setUsername] = useState('');
+      const [password, setPassword] = useState('');
+      const [error, setError] = useState('');
+      const [loading, setLoading] = useState(false);
+
+      async function handleSubmit(e) {
+        e.preventDefault();
+        setError(''); setLoading(true);
+        try {
+          const data = await apiLogin(username, password);
+          setToken(data.token);
+          sessionStorage.setItem('ftth_user', data.username);
+          onLogin(data.username);
+        } catch (err) {
+          setError(err.message);
+        } finally {
+          setLoading(false);
+        }
+      }
+
+      return (
+        <div className="min-h-screen bg-dark-900 flex items-center justify-center px-4">
+          <div className="w-full max-w-sm">
+            <div className="flex items-center justify-center gap-3 mb-8">
+              <div className="w-10 h-10 bg-blue-600 rounded-lg flex items-center justify-center font-bold text-lg">M</div>
+              <div>
+                <div className="font-bold text-xl text-white">Meridian</div>
+                <div className="text-xs text-gray-400">FTTH Data Ingestion</div>
+              </div>
+            </div>
+            <form onSubmit={handleSubmit} className="bg-dark-800 border border-dark-600 rounded-2xl p-8 shadow-xl space-y-5">
+              <h2 className="text-lg font-semibold text-white text-center">Sign in to your account</h2>
+              {error && (
+                <div className="bg-red-900/40 border border-red-700 text-red-300 rounded-lg px-4 py-2 text-sm">{error}</div>
+              )}
+              <div className="space-y-1">
+                <label className="text-xs text-gray-400 font-medium">Username</label>
+                <input
+                  type="text" value={username} onChange={e => setUsername(e.target.value)}
+                  required autoFocus autoComplete="username"
+                  className="w-full bg-dark-700 border border-dark-600 rounded-lg px-4 py-2.5 text-white text-sm outline-none focus:border-blue-500 transition"
+                  placeholder="Enter username"
+                />
+              </div>
+              <div className="space-y-1">
+                <label className="text-xs text-gray-400 font-medium">Password</label>
+                <input
+                  type="password" value={password} onChange={e => setPassword(e.target.value)}
+                  required autoComplete="current-password"
+                  className="w-full bg-dark-700 border border-dark-600 rounded-lg px-4 py-2.5 text-white text-sm outline-none focus:border-blue-500 transition"
+                  placeholder="Enter password"
+                />
+              </div>
+              <button
+                type="submit" disabled={loading}
+                className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-60 text-white font-semibold rounded-lg py-2.5 text-sm transition"
+              >{loading ? 'Signing in…' : 'Sign In'}</button>
+            </form>
+          </div>
+        </div>
+      );
+    }
+
     function App() {
+      const [user, setUser] = useState(getToken() ? getUser() : null);
       const { path, navigate } = useRouter();
+
+      // Auto-logout when server rejects our token (e.g. after server restart)
+      useEffect(() => {
+        const handler = () => { clearToken(); setUser(null); };
+        window.addEventListener('ftth-unauthorized', handler);
+        return () => window.removeEventListener('ftth-unauthorized', handler);
+      }, []);
+
+      if (!user) return <LoginPage onLogin={u => setUser(u)} />;
 
       // Route matching
       if (path.match(/^\/projects\/([^/]+)\/map$/)) {
         const jobId = path.match(/^\/projects\/([^/]+)\/map$/)[1];
-        return <Layout><MapPage jobId={jobId} navigate={navigate} /></Layout>;
+        return <Layout user={user} onLogout={() => { clearToken(); setUser(null); }}><MapPage jobId={jobId} navigate={navigate} /></Layout>;
       }
       if (path.match(/^\/projects\/([^/]+)$/)) {
         const jobId = path.match(/^\/projects\/([^/]+)$/)[1];
-        return <Layout><ProjectDetailPage jobId={jobId} navigate={navigate} /></Layout>;
+        return <Layout user={user} onLogout={() => { clearToken(); setUser(null); }}><ProjectDetailPage jobId={jobId} navigate={navigate} /></Layout>;
       }
-      return <Layout><ProjectsPage navigate={navigate} /></Layout>;
+      return <Layout user={user} onLogout={() => { clearToken(); setUser(null); }}><ProjectsPage navigate={navigate} /></Layout>;
     }
 
-    function Layout({ children }) {
+    function Layout({ children, user, onLogout }) {
+      const initials = (user || 'U').slice(0, 2).toUpperCase();
       return (
         <div className="min-h-screen bg-dark-900 text-white">
           <header className="border-b border-dark-700 px-6 py-3 flex items-center justify-between">
@@ -1032,8 +1427,9 @@
               <button className="p-2 hover:bg-dark-700 rounded text-gray-400">☀</button>
               <button className="p-2 hover:bg-dark-700 rounded text-gray-400">⚙</button>
               <div className="flex items-center gap-2">
-                <span className="text-sm text-gray-400">Email User<br/><span className="text-xs">via Email</span></span>
-                <div className="w-8 h-8 bg-blue-600 rounded-full flex items-center justify-center font-bold text-sm">EU</div>
+                <span className="text-sm text-gray-400">{user}<br/><span className="text-xs text-gray-500">Signed in</span></span>
+                <div className="w-8 h-8 bg-blue-600 rounded-full flex items-center justify-center font-bold text-sm">{initials}</div>
+                <button onClick={onLogout} className="text-xs text-gray-400 hover:text-red-400 px-2 py-1 rounded transition">Sign out</button>
               </div>
             </div>
           </header>
