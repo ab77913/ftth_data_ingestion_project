@@ -1,0 +1,22 @@
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    container_name: ftth-postgis
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ftth
+      POSTGRES_PASSWORD: ftth
+      POSTGRES_DB: ftth
+    ports:
+      - "5432:5432"
+    volumes:
+      - ftth_postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_postgis.sql:/docker-entrypoint-initdb.d/init_postgis.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ftth -d ftth"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  ftth_postgres_data:
