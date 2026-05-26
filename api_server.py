@@ -201,6 +201,7 @@ def logout(creds: HTTPAuthorizationCredentials | None = Security(_bearer)):
 
 # ─── Endpoints ──────────────────────────────────────────────────────────────────
 
+
 @app.post("/api/upload", response_model=UploadResponse)
 async def upload_file(
     file: UploadFile = File(...),
