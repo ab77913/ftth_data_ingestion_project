@@ -13,15 +13,8 @@ from src.core.output import write_outputs
 from src.models.schemas import FinalValidationRecord
 from src.utils.logging import get_logger
 
-from src.providers.cache_lookup import (
-    generate_cache_key,
-    get_cached_result,
-    save_cached_result
-)
-
-from src.core.provider_arbitration import (
-    provider_arbitration
-)
+from src.providers.cache_lookup import AddressCache, generate_cache_key
+from src.core.provider_arbitration import provider_arbitration
 
 logger = get_logger(__name__)
 
@@ -42,125 +35,73 @@ def run(input_path: str, output_path: str, limit: int | None = None, use_mock: b
     smarty_provider, melissa_provider = build_providers(use_mock)
     final_records = []
 
-    # for raw in raw_records:
-    #     canonical = canonicalize(raw)
-    #     smarty = smarty_provider.validate(canonical)
-        # melissa = melissa_provider.validate(canonical)
+    # Load cache ONCE at the start of the run
+    cache = AddressCache().load()
+    logger.info("Cache loaded â€” %d existing entries", cache.stats()["total_entries"])
 
     for raw in raw_records:
-
-        smarty = None
-        melissa = None
-        chosen = None
-        score = 0
-        comparison = None
 
         canonical = canonicalize(raw)
 
         print("\n========== CANONICAL ==========")
-        print(vars(canonical))
-
-        print("\n==============================")
-        print("RAW ADDRESS:")
-        print(canonical.raw_address)
-
-        print("\nCANONICAL OBJECT:")
-        print(vars(canonical))
-
-        # smarty = smarty_provider.validate(canonical)
-
-        # print("\n========== SMARTY ==========")
-        # print(vars(smarty))
-
-        # print("\nSMARTY RESPONSE:")
-        # print(vars(smarty))
-
-        # melissa = melissa_provider.validate(canonical)
-
-        # print("\nMELISSA RESPONSE:")
-        # print(vars(melissa))
-        
-        # comparison = compare_results(smarty, melissa)
-        # chosen, score = choose_result(smarty, melissa, comparison)
-
+        print(canonical.normalized_full_address)
 
         cache_key = generate_cache_key(canonical)
-
-        cached_result = get_cached_result(cache_key)
+        cached = cache.get(cache_key)
 
         # =========================
-        # CACHE HIT
+        # CACHE HIT â€” no API call
         # =========================
-        if cached_result:
-
+        if cached:
             print("\n========== CACHE HIT ==========")
+            logger.debug("Cache hit for: %s", canonical.normalized_full_address)
 
-            final_records.append(
-                FinalValidationRecord(
-                    source_file=canonical.source_file,
-                    row_id=canonical.row_id,
-                    address_id=canonical.address_id,
-                    raw_address=canonical.raw_address,
-                    canonical_address=canonical.normalized_full_address,
-
-                    smarty_standardized_address=None,
-                    melissa_standardized_address=None,
-
-                    chosen_standardized_address=cached_result.get(
-                        "standardized_address"
-                    ),
-
-                    smarty_dpv=None,
-                    melissa_dpv=None,
-
-                    smarty_zip_plus_4=None,
-                    melissa_zip_plus_4=None,
-
-                    smarty_vacant=None,
-                    melissa_vacant=None,
-
-                    smarty_record_type=None,
-                    melissa_record_type=None,
-
-                    chosen_provider=cached_result.get(
-                        "provider"
-                    ),
-
-                    structure_hint="CACHE_HIT",
-
-                    confidence_score=cached_result.get(
-                        "score", 0
-                    ),
-
-                    # validation_status="AUTO_ACCEPT",
-                    validation_status=(
-                        "AUTO_ACCEPT"
-                        if cached_result.get("score", 0) >= 80
-                        else "MANUAL_REVIEW"
-                        if cached_result.get("score", 0) >= 40
-                        else "REJECT"
-                    ),
-
-                    exception_reason=None,
-
-                    comparison_reason="Loaded from cache"
-                )
+            score = cached.get("confidence_score", cached.get("score", 0))
+            status = cached.get("validation_status") or (
+                "AUTO_ACCEPT" if score >= 80
+                else "MANUAL_REVIEW" if score >= 40
+                else "REJECT"
             )
 
+            final_records.append(FinalValidationRecord(
+                source_file=canonical.source_file,
+                row_id=canonical.row_id,
+                address_id=canonical.address_id,
+                raw_address=canonical.raw_address,
+                canonical_address=canonical.normalized_full_address,
+                # Restore full provider data if available in cache
+                smarty_standardized_address=cached.get("smarty_standardized_address"),
+                melissa_standardized_address=cached.get("melissa_standardized_address"),
+                chosen_standardized_address=cached.get("chosen_standardized_address")
+                    or cached.get("standardized_address"),
+                smarty_dpv=cached.get("smarty_dpv"),
+                melissa_dpv=cached.get("melissa_dpv"),
+                smarty_zip_plus_4=cached.get("smarty_zip_plus_4"),
+                melissa_zip_plus_4=cached.get("melissa_zip_plus_4"),
+                smarty_vacant=cached.get("smarty_vacant"),
+                melissa_vacant=cached.get("melissa_vacant"),
+                smarty_record_type=cached.get("smarty_record_type"),
+                melissa_record_type=cached.get("melissa_record_type"),
+                chosen_provider=cached.get("chosen_provider", cached.get("provider", "cache")),
+                structure_hint=cached.get("structure_hint", "CACHE_HIT"),
+                confidence_score=score,
+                validation_status=status,
+                exception_reason=cached.get("exception_reason"),
+                comparison_reason="Loaded from cache",
+            ))
             continue
 
         # =========================
-        # CACHE MISS
+        # CACHE MISS â€” call APIs
         # =========================
-        print("\n========== CACHE MISS ==========")
+        print("\n========== CACHE MISS â€” calling APIs ==========")
+        logger.debug("Cache miss for: %s", canonical.normalized_full_address)
 
         smarty = smarty_provider.validate(canonical)
-
         print("\n========== SMARTY ==========")
         print(vars(smarty))
 
         melissa = melissa_provider.validate(canonical)
-
         print("\n========== MELISSA ==========")
         print(vars(melissa))
 
@@ -168,38 +109,56 @@ def run(input_path: str, output_path: str, limit: int | None = None, use_mock: b
         # COMPARISON
         # =========================
         if smarty.success and melissa.success:
-
-            comparison = compare_results(
-                smarty,
-                melissa
-            )
-
+            comparison = compare_results(smarty, melissa)
         else:
-
             comparison = None
 
         # =========================
         # PROVIDER ARBITRATION
         # =========================
-        chosen, score = provider_arbitration(
-            smarty,
-            melissa
-        )
-
-        # =========================
-        # SAVE CACHE
-        # =========================
-        save_cached_result(
-            cache_key,
-            {
-                "provider": chosen.provider,
-                "score": score,
-                "standardized_address": chosen.standardized_address
-            }
-        )
+        chosen, score = provider_arbitration(smarty, melissa)
 
         hint = structure_hint(chosen, canonical.normalized_full_address)
         status, exception_reason = validation_status(score, chosen, comparison)
+        comparison_reason = (
+            f"{comparison.conflict_level}: {comparison.reason}"
+            if comparison
+            else "Both providers failed"
+        )
+
+        # =========================
+        # SAVE FULL RESULT TO CACHE
+        # Store everything needed so future cache hits return complete data.
+        # =========================
+        cache.set(cache_key, {
+            # Identity
+            "normalized_full_address": canonical.normalized_full_address,
+            # Chosen result
+            "chosen_provider": chosen.provider,
+            "chosen_standardized_address": chosen.standardized_address,
+            "confidence_score": score,
+            "validation_status": status,
+            "structure_hint": hint,
+            "exception_reason": exception_reason,
+            # Smarty details
+            "smarty_standardized_address": smarty.standardized_address,
+            "smarty_dpv": smarty.dpv_match,
+            "smarty_zip_plus_4": smarty.zip_plus_4,
+            "smarty_vacant": smarty.vacant,
+            "smarty_record_type": smarty.record_type,
+            "smarty_lat": smarty.latitude,
+            "smarty_lon": smarty.longitude,
+            "smarty_geocode_precision": smarty.geocode_precision,
+            # Melissa details
+            "melissa_standardized_address": melissa.standardized_address,
+            "melissa_dpv": melissa.dpv_match,
+            "melissa_zip_plus_4": melissa.zip_plus_4,
+            "melissa_vacant": melissa.vacant,
+            "melissa_record_type": melissa.record_type,
+            "melissa_lat": melissa.latitude,
+            "melissa_lon": melissa.longitude,
+        })
+
         final_records.append(FinalValidationRecord(
             source_file=canonical.source_file,
             row_id=canonical.row_id,
@@ -222,13 +181,14 @@ def run(input_path: str, output_path: str, limit: int | None = None, use_mock: b
             confidence_score=score,
             validation_status=status,
             exception_reason=exception_reason,
-            # comparison_reason=f"{comparison.conflict_level}: {comparison.reason}",
-            comparison_reason=(
-                f"{comparison.conflict_level}: {comparison.reason}"
-                if comparison
-                else "Both providers failed"
-            ),
+            comparison_reason=comparison_reason,
         ))
+
+    # Save cache ONCE at end (efficient â€” no per-address file writes)
+    cache.save()
+    logger.info("Cache saved â€” %d total entries", cache.stats()["total_entries"])
+    cache.print_stats()
+
     paths = write_outputs(final_records, output_path)
     logger.info("Output generated: %s", paths)
     return paths
@@ -246,3 +206,5 @@ if __name__ == "__main__":
     if args.real_apis:
         use_mock = False
     run(args.input, args.output, args.limit, use_mock)
+
+

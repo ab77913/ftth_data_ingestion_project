@@ -17,6 +17,7 @@ Run: python api_server.py
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import csv
 import io
 import json
@@ -52,7 +53,13 @@ from data_ingestion.database.repositories import IngestionRepository
 from data_ingestion.ingestion_service import IngestionService
 from data_ingestion.schemas import IngestionStatus
 
-app = FastAPI(title="FTTH Data Ingestion API", version="1.0.0")
+@contextlib.asynccontextmanager
+async def _lifespan(_app: "FastAPI"):
+    init_db()
+    yield
+
+
+app = FastAPI(title="FTTH Data Ingestion API", version="1.0.0", lifespan=_lifespan)
 
 # ─── Auth ───────────────────────────────────────────────────────────────────────
 
@@ -169,13 +176,6 @@ class ColumnInfo(BaseModel):
     key: str
     label: str
     visible: bool = True
-
-
-# ─── Startup ────────────────────────────────────────────────────────────────────
-
-@app.on_event("startup")
-def startup():
-    init_db()
 
 
 # ─── Auth endpoints ─────────────────────────────────────────────────────────────

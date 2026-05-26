@@ -6,9 +6,12 @@ Called from api_server.py when the user presses "Process" for a job.
 Flow:
   1. Read addresses from the `addresses` table for the given job_id
   2. Build a RawAddressRecord for each row
-  3. Canonicalize → run Smarty → run Melissa → arbitrate → score
+  3. Canonicalize → check cache
+       CACHE HIT  → restore result from cache, skip API calls
+       CACHE MISS → run Smarty + Melissa → arbitrate → score → write cache
   4. Upsert results into `agent1_results`
   5. Back-fill lat/lon on the `addresses` row if it was missing
+  6. Save cache once at the end of the run
 """
 from __future__ import annotations
 
@@ -40,6 +43,9 @@ from src.providers.melissa_adapter import MelissaProvider  # noqa: E402
 from src.core.compare import compare_results             # noqa: E402
 from src.core.scoring import choose_result, structure_hint, validation_status  # noqa: E402
 from src.core.provider_arbitration import provider_arbitration  # noqa: E402
+from src.providers.cache_lookup import AddressCache, generate_cache_key  # noqa: E402
+
+_CACHE_FILE = AGENT_SRC / "cache" / "cache.json"
 
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -87,8 +93,12 @@ def run_agent1_for_job(job_id: str, progress_callback=None) -> dict:
     smarty   = SmartyProvider()
     melissa  = MelissaProvider()
 
+    # Load cache once — avoids per-address disk I/O
+    cache = AddressCache(cache_file=_CACHE_FILE).load()
+    logger.info("Agent1: cache loaded — %d existing entries", cache.stats()["total_entries"])
+
     summary = {"total": 0, "auto_accept": 0, "manual_review": 0,
-               "reject": 0, "errored": 0}
+               "reject": 0, "errored": 0, "cache_hits": 0, "cache_misses": 0}
     try:
         from sqlalchemy import select as _sel
         addresses = session.scalars(
@@ -101,37 +111,13 @@ def run_agent1_for_job(job_id: str, progress_callback=None) -> dict:
 
         for idx, addr in enumerate(addresses, 1):
             try:
-                raw_rec  = _row_to_raw(addr)
+                raw_rec   = _row_to_raw(addr)
                 canonical = canonicalize(raw_rec)
 
-                # ── Smarty ────────────────────────────────────────────────────
-                smarty_result  = smarty.validate(canonical)
+                cache_key = generate_cache_key(canonical)
+                cached    = cache.get(cache_key)
 
-                # ── Melissa ───────────────────────────────────────────────────
-                melissa_result = melissa.validate(canonical)
-
-                # ── Compare / arbitrate ───────────────────────────────────────
-                comparison = None
-                if smarty_result.success and melissa_result.success:
-                    try:
-                        comparison = compare_results(smarty_result, melissa_result)
-                    except Exception:
-                        comparison = None
-
-                chosen, score = provider_arbitration(smarty_result, melissa_result)
-
-                hint   = structure_hint(chosen, canonical.normalized_full_address)
-                status, exc_reason = validation_status(score, chosen, comparison)
-
-                comparison_reason = (
-                    f"{comparison.conflict_level}: {comparison.reason}"
-                    if comparison
-                    else ("smarty_only" if smarty_result.success else
-                          "melissa_only" if melissa_result.success else
-                          "both_failed")
-                )
-
-                # ── Upsert into agent1_results ─────────────────────────────
+                # ── Upsert skeleton ───────────────────────────────────────────
                 existing = session.scalar(
                     _sel(Agent1Result).where(Agent1Result.address_id == addr.id)
                 )
@@ -144,56 +130,150 @@ def run_agent1_for_job(job_id: str, progress_callback=None) -> dict:
                                       created_at=now, updated_at=now)
                     session.add(row)
 
-                row.raw_address                  = canonical.raw_address
-                row.canonical_address            = canonical.normalized_full_address
-                row.smarty_standardized_address  = smarty_result.standardized_address
-                row.smarty_dpv                   = smarty_result.dpv_match
-                row.smarty_zip_plus_4            = smarty_result.zip_plus_4
-                row.smarty_vacant                = smarty_result.vacant
-                row.smarty_record_type           = smarty_result.record_type
-                row.smarty_lat                   = smarty_result.latitude
-                row.smarty_lon                   = smarty_result.longitude
-                row.melissa_standardized_address = melissa_result.standardized_address
-                row.melissa_dpv                  = melissa_result.dpv_match
-                row.melissa_zip_plus_4           = melissa_result.zip_plus_4
-                row.melissa_vacant               = melissa_result.vacant
-                row.melissa_record_type          = melissa_result.record_type
-                row.chosen_standardized_address  = chosen.standardized_address
-                row.chosen_provider              = chosen.provider
-                row.structure_hint               = hint
-                row.confidence_score             = score
-                row.validation_status            = status
-                row.exception_reason             = exc_reason
-                row.comparison_reason            = comparison_reason
+                row.raw_address       = canonical.raw_address
+                row.canonical_address = canonical.normalized_full_address
+
+                if cached:
+                    # ── CACHE HIT — restore from cache, no API calls ──────────
+                    logger.debug("Agent1 cache hit: %s", canonical.normalized_full_address)
+                    summary["cache_hits"] += 1
+
+                    score  = cached.get("confidence_score", cached.get("score", 0))
+                    status = cached.get("validation_status") or (
+                        "AUTO_ACCEPT"   if score >= 80 else
+                        "MANUAL_REVIEW" if score >= 40 else
+                        "REJECT"
+                    )
+
+                    row.smarty_standardized_address  = cached.get("smarty_standardized_address")
+                    row.smarty_dpv                   = cached.get("smarty_dpv")
+                    row.smarty_zip_plus_4            = cached.get("smarty_zip_plus_4")
+                    row.smarty_vacant                = cached.get("smarty_vacant")
+                    row.smarty_record_type           = cached.get("smarty_record_type")
+                    row.smarty_lat                   = cached.get("smarty_lat")
+                    row.smarty_lon                   = cached.get("smarty_lon")
+                    row.melissa_standardized_address = cached.get("melissa_standardized_address")
+                    row.melissa_dpv                  = cached.get("melissa_dpv")
+                    row.melissa_zip_plus_4           = cached.get("melissa_zip_plus_4")
+                    row.melissa_vacant               = cached.get("melissa_vacant")
+                    row.melissa_record_type          = cached.get("melissa_record_type")
+                    row.chosen_standardized_address  = (
+                        cached.get("chosen_standardized_address")
+                        or cached.get("standardized_address")
+                    )
+                    row.chosen_provider              = cached.get("chosen_provider", cached.get("provider", "cache"))
+                    row.structure_hint               = cached.get("structure_hint", "CACHE_HIT")
+                    row.confidence_score             = score
+                    row.validation_status            = status
+                    row.exception_reason             = cached.get("exception_reason")
+                    row.comparison_reason            = "Loaded from cache"
+
+                    smarty_lat = cached.get("smarty_lat")
+                    smarty_lon = cached.get("smarty_lon")
+                    smarty_zip = cached.get("smarty_zip_plus_4")
+
+                else:
+                    # ── CACHE MISS — call APIs ────────────────────────────────
+                    logger.debug("Agent1 cache miss: %s", canonical.normalized_full_address)
+                    summary["cache_misses"] += 1
+
+                    smarty_result  = smarty.validate(canonical)
+                    melissa_result = melissa.validate(canonical)
+
+                    comparison = None
+                    if smarty_result.success and melissa_result.success:
+                        try:
+                            comparison = compare_results(smarty_result, melissa_result)
+                        except Exception:
+                            comparison = None
+
+                    chosen, score = provider_arbitration(smarty_result, melissa_result)
+                    hint   = structure_hint(chosen, canonical.normalized_full_address)
+                    status, exc_reason = validation_status(score, chosen, comparison)
+                    comparison_reason = (
+                        f"{comparison.conflict_level}: {comparison.reason}"
+                        if comparison
+                        else ("smarty_only" if smarty_result.success else
+                              "melissa_only" if melissa_result.success else
+                              "both_failed")
+                    )
+
+                    row.smarty_standardized_address  = smarty_result.standardized_address
+                    row.smarty_dpv                   = smarty_result.dpv_match
+                    row.smarty_zip_plus_4            = smarty_result.zip_plus_4
+                    row.smarty_vacant                = smarty_result.vacant
+                    row.smarty_record_type           = smarty_result.record_type
+                    row.smarty_lat                   = smarty_result.latitude
+                    row.smarty_lon                   = smarty_result.longitude
+                    row.melissa_standardized_address = melissa_result.standardized_address
+                    row.melissa_dpv                  = melissa_result.dpv_match
+                    row.melissa_zip_plus_4           = melissa_result.zip_plus_4
+                    row.melissa_vacant               = melissa_result.vacant
+                    row.melissa_record_type          = melissa_result.record_type
+                    row.chosen_standardized_address  = chosen.standardized_address
+                    row.chosen_provider              = chosen.provider
+                    row.structure_hint               = hint
+                    row.confidence_score             = score
+                    row.validation_status            = status
+                    row.exception_reason             = exc_reason
+                    row.comparison_reason            = comparison_reason
+
+                    smarty_lat = smarty_result.latitude
+                    smarty_lon = smarty_result.longitude
+                    smarty_zip = smarty_result.zip_plus_4
+
+                    # ── Write full result to cache ────────────────────────────
+                    cache.set(cache_key, {
+                        "normalized_full_address":       canonical.normalized_full_address,
+                        "chosen_provider":               chosen.provider,
+                        "chosen_standardized_address":   chosen.standardized_address,
+                        "confidence_score":              score,
+                        "validation_status":             status,
+                        "structure_hint":                hint,
+                        "exception_reason":              exc_reason,
+                        "smarty_standardized_address":   smarty_result.standardized_address,
+                        "smarty_dpv":                    smarty_result.dpv_match,
+                        "smarty_zip_plus_4":             smarty_result.zip_plus_4,
+                        "smarty_vacant":                 smarty_result.vacant,
+                        "smarty_record_type":            smarty_result.record_type,
+                        "smarty_lat":                    smarty_result.latitude,
+                        "smarty_lon":                    smarty_result.longitude,
+                        "smarty_geocode_precision":      smarty_result.geocode_precision,
+                        "melissa_standardized_address":  melissa_result.standardized_address,
+                        "melissa_dpv":                   melissa_result.dpv_match,
+                        "melissa_zip_plus_4":            melissa_result.zip_plus_4,
+                        "melissa_vacant":                melissa_result.vacant,
+                        "melissa_record_type":           melissa_result.record_type,
+                        "melissa_lat":                   melissa_result.latitude,
+                        "melissa_lon":                   melissa_result.longitude,
+                    })
 
                 # ── Back-fill lat/lon on addresses row if missing or zero ─────
-                if smarty_result.latitude and (not addr.latitude or addr.latitude == 0):
-                    addr.latitude  = smarty_result.latitude
-                    addr.longitude = smarty_result.longitude
+                if smarty_lat and (not addr.latitude or addr.latitude == 0):
+                    addr.latitude  = smarty_lat
+                    addr.longitude = smarty_lon
 
                 # ── Also write into raw_metadata so table displays correct values
-                if smarty_result.latitude:
+                if smarty_lat:
                     meta = dict(addr.raw_metadata or {})
-                    # Find and update any of the known lat/lon column names
                     for k in list(meta.keys()):
                         kl = k.lower().replace(" ", "_")
                         if kl == "network_node_latitude":
-                            meta[k] = smarty_result.latitude
+                            meta[k] = smarty_lat
                         elif kl == "network_node_longitude":
-                            meta[k] = smarty_result.longitude
+                            meta[k] = smarty_lon
                     addr.raw_metadata = meta
                     flag_modified(addr, "raw_metadata")
 
                 # ── Back-fill zip+4 on addresses row if missing ────────────
-                if not addr.zip_code and smarty_result.zip_plus_4:
-                    addr.zip_code = smarty_result.zip_plus_4
+                if not addr.zip_code and smarty_zip:
+                    addr.zip_code = smarty_zip
 
                 session.flush()
 
-                # tally
-                if status == "AUTO_ACCEPT":
+                if row.validation_status == "AUTO_ACCEPT":
                     summary["auto_accept"] += 1
-                elif status == "MANUAL_REVIEW":
+                elif row.validation_status == "MANUAL_REVIEW":
                     summary["manual_review"] += 1
                 else:
                     summary["reject"] += 1
@@ -206,6 +286,10 @@ def run_agent1_for_job(job_id: str, progress_callback=None) -> dict:
                 progress_callback(idx, total)
 
         session.commit()
+
+        # Save cache once — efficient, no per-address file writes
+        cache.save()
+        logger.info("Agent1: cache saved — %d total entries", cache.stats()["total_entries"])
         logger.info("Agent1 complete: %s", summary)
         return summary
 

@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls \"C:\\\\Users\\\\Admin\\\\OneDrive - Cyient Ltd\\\\Documents\\\\FTTH_PROD_frontend\\\\react-app\" 2>/dev/null || echo \"Path not found\")",
+      "Read(//c/Users/Admin/OneDrive - Cyient Ltd/Documents/FTTH_PROD_frontend/**)",
+      "Bash(del \"c:\\\\Users\\\\Admin\\\\ftth_data_ingestion_project\\\\start_nginx.bat\")",
+      "Bash(venv\\\\Scripts\\\\python.exe -m pip list)",
+      "PowerShell(cd \"C:\\\\Users\\\\Admin\\\\ftth_data_ingestion_project\"; $proc = Start-Process -FilePath \".\\\\venv\\\\Scripts\\\\python.exe\" -ArgumentList \"api_server.py\" -PassThru -NoNewWindow -RedirectStandardOutput \"$env:TEMP\\\\ftth_out.txt\" -RedirectStandardError \"$env:TEMP\\\\ftth_err.txt\"; Start-Sleep 5; $proc.HasExited; Get-Content \"$env:TEMP\\\\ftth_out.txt\" -ErrorAction SilentlyContinue; Get-Content \"$env:TEMP\\\\ftth_err.txt\" -ErrorAction SilentlyContinue; if \\(-not $proc.HasExited\\) { $proc.Kill\\(\\) })",
+      "PowerShell(cd \"C:\\\\Users\\\\Admin\\\\ftth_data_ingestion_project\"; $proc = Start-Process -FilePath \".\\\\venv\\\\Scripts\\\\python.exe\" -ArgumentList \"api_server.py\" -PassThru -NoNewWindow -RedirectStandardOutput \"$env:TEMP\\\\ftth_out.txt\" -RedirectStandardError \"$env:TEMP\\\\ftth_err.txt\"; Start-Sleep 5; Get-Content \"$env:TEMP\\\\ftth_out.txt\" -ErrorAction SilentlyContinue; Get-Content \"$env:TEMP\\\\ftth_err.txt\" -ErrorAction SilentlyContinue; if \\(-not $proc.HasExited\\) { $proc.Kill\\(\\) })"
+    ]
+  }
+}
