@@ -158,6 +158,56 @@ class AgentTable(Base):
     )
 
 
+class Agent1Result(Base):
+    """Stores Address Validation Agent 1 (Smarty + Melissa) results per address."""
+
+    __tablename__ = "agent1_results"
+    __table_args__ = (
+        UniqueConstraint("address_id", name="uq_agent1_results_address_id"),
+        Index("ix_agent1_results_job_id", "job_id"),
+        Index("ix_agent1_results_address_id", "address_id"),
+        Index("ix_agent1_results_validation_status", "validation_status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_id: Mapped[object] = mapped_column(UUID(as_uuid=True), ForeignKey("ingestion_jobs.id"), nullable=False)
+    address_id: Mapped[int] = mapped_column(Integer, ForeignKey("addresses.id"), nullable=False)
+
+    # Raw + canonical
+    raw_address: Mapped[str | None] = mapped_column(Text, nullable=True)
+    canonical_address: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Smarty output
+    smarty_standardized_address: Mapped[str | None] = mapped_column(Text, nullable=True)
+    smarty_dpv: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    smarty_zip_plus_4: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    smarty_vacant: Mapped[bool | None] = mapped_column(nullable=True)
+    smarty_record_type: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    smarty_lat: Mapped[float | None] = mapped_column(Float, nullable=True)
+    smarty_lon: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # Melissa output
+    melissa_standardized_address: Mapped[str | None] = mapped_column(Text, nullable=True)
+    melissa_dpv: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    melissa_zip_plus_4: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    melissa_vacant: Mapped[bool | None] = mapped_column(nullable=True)
+    melissa_record_type: Mapped[str | None] = mapped_column(String(10), nullable=True)
+
+    # Final chosen result
+    chosen_standardized_address: Mapped[str | None] = mapped_column(Text, nullable=True)
+    chosen_provider: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    structure_hint: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    confidence_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    validation_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    exception_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    comparison_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+
 class AgentResult(Base):
     """Stores one agent team's processed output per address record."""
 

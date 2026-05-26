@@ -29,6 +29,9 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+import openpyxl
+from openpyxl.styles import PatternFill, Font
+
 import hashlib
 import hmac
 import secrets
@@ -43,7 +46,8 @@ from sqlalchemy import String, func, select, text
 
 from data_ingestion.config.settings import get_settings
 from data_ingestion.database.db import get_engine, get_session_factory, init_db, session_scope
-from data_ingestion.database.models import Address, AgentResult, AgentTable, DispatchQueue, IngestionJob
+from data_ingestion.database.models import Address, Agent1Result, AgentResult, AgentTable, DispatchQueue, IngestionJob
+from data_ingestion.agents.agent1_runner import run_agent1_for_job
 from data_ingestion.database.repositories import IngestionRepository
 from data_ingestion.ingestion_service import IngestionService
 from data_ingestion.schemas import IngestionStatus
@@ -395,6 +399,64 @@ def list_records(
         # Build dynamic columns based on raw_metadata from the first record
         columns = _get_raw_columns(session, job_id)
 
+        # Load Agent 1 results for these address ids to overlay validated lat/lon
+        addr_ids = [a.id for a in addresses]
+        agent1_map: dict[int, Agent1Result] = {}
+        if addr_ids:
+            from sqlalchemy import select as _sel2
+            a1_rows = session.execute(
+                _sel2(Agent1Result).where(Agent1Result.address_id.in_(addr_ids))
+            ).scalars().all()
+            agent1_map = {r.address_id: r for r in a1_rows}
+
+        # Append agent1 columns to schema if any agent1 results exist for this job
+        if agent1_map:
+            A1_SCHEMA = [
+                ("agent1_validation_status",       "Agent1: Validation Status"),
+                ("agent1_confidence_score",         "Agent1: Confidence Score"),
+                ("agent1_canonical_address",        "Agent1: Canonical Address"),
+                ("agent1_chosen_provider",          "Agent1: Chosen Provider"),
+                ("agent1_smarty_lat",               "Agent1: Smarty Latitude"),
+                ("agent1_smarty_lon",               "Agent1: Smarty Longitude"),
+                ("agent1_smarty_standardized",      "Agent1: Smarty Standardized"),
+                ("agent1_smarty_dpv",               "Agent1: Smarty DPV"),
+                ("agent1_smarty_zip_plus_4",        "Agent1: Smarty ZIP+4"),
+                ("agent1_melissa_standardized",     "Agent1: Melissa Standardized"),
+                ("agent1_melissa_dpv",              "Agent1: Melissa DPV"),
+                ("agent1_exception_reason",         "Agent1: Exception Reason"),
+            ]
+            existing_keys = {c["key"] for c in columns}
+            for key, label in A1_SCHEMA:
+                if key not in existing_keys:
+                    columns.append({"key": key, "label": label, "visible": True, "source": "agent1"})
+
+        def _merge_meta(a: Address) -> dict:
+            """Return raw_metadata with Smarty lat/lon overwritten and agent1 fields appended."""
+            meta = dict(a.raw_metadata or {})
+            a1 = agent1_map.get(a.id)
+            if a1 and a1.smarty_lat:
+                for k in list(meta.keys()):
+                    kl = k.lower().replace(" ", "_")
+                    if kl == "network_node_latitude":
+                        meta[k] = a1.smarty_lat
+                    elif kl == "network_node_longitude":
+                        meta[k] = a1.smarty_lon
+            # Append agent1 fields so frontend can read them via raw_data[key]
+            if a1:
+                meta["agent1_validation_status"]   = a1.validation_status or ""
+                meta["agent1_confidence_score"]     = a1.confidence_score
+                meta["agent1_canonical_address"]    = a1.canonical_address or ""
+                meta["agent1_chosen_provider"]      = a1.chosen_provider or ""
+                meta["agent1_smarty_lat"]           = a1.smarty_lat
+                meta["agent1_smarty_lon"]           = a1.smarty_lon
+                meta["agent1_smarty_standardized"]  = a1.smarty_standardized_address or ""
+                meta["agent1_smarty_dpv"]           = a1.smarty_dpv or ""
+                meta["agent1_smarty_zip_plus_4"]    = a1.smarty_zip_plus_4 or ""
+                meta["agent1_melissa_standardized"] = a1.melissa_standardized_address or ""
+                meta["agent1_melissa_dpv"]          = a1.melissa_dpv or ""
+                meta["agent1_exception_reason"]     = a1.exception_reason or ""
+            return meta
+
         records = [
             RecordResponse(
                 id=a.id,
@@ -417,9 +479,9 @@ def list_records(
                 source_row_number=a.source_row_number,
                 validation_errors=a.validation_errors,
                 validation_warnings=a.validation_warnings,
-                raw_metadata=a.raw_metadata,
+                raw_metadata=_merge_meta(a),
                 created_at=a.created_at.isoformat(),
-                raw_data=a.raw_metadata if a.raw_metadata else None,
+                raw_data=_merge_meta(a),
             )
             for a in addresses
         ]
@@ -448,21 +510,34 @@ def get_geo_records(
     """Get records with coordinates for map display (lightweight GeoJSON-like response)."""
     session = get_session_factory()()
     try:
-        stmt = select(
-            Address.id,
-            Address.latitude,
-            Address.longitude,
-            Address.raw_address,
-            Address.city,
-            Address.state,
-            Address.network_node,
-            Address.terminal_id,
-            Address.source_file,
-            Address.source_row_number,
-            Address.raw_metadata,
-        ).where(
-            Address.latitude.isnot(None),
-            Address.longitude.isnot(None),
+        stmt = (
+            select(
+                Address.id,
+                Address.latitude,
+                Address.longitude,
+                Address.raw_address,
+                Address.city,
+                Address.state,
+                Address.network_node,
+                Address.terminal_id,
+                Address.source_file,
+                Address.source_row_number,
+                Address.raw_metadata,
+                # Agent 1 validation columns (NULL when not yet processed)
+                Agent1Result.canonical_address,
+                Agent1Result.validation_status,
+                Agent1Result.confidence_score,
+                Agent1Result.chosen_provider,
+                Agent1Result.smarty_lat,
+                Agent1Result.smarty_lon,
+            )
+            .outerjoin(Agent1Result, Agent1Result.address_id == Address.id)
+            .where(
+                Address.latitude.isnot(None),
+                Address.longitude.isnot(None),
+                Address.latitude != 0,
+                Address.longitude != 0,
+            )
         )
 
         if job_id:
@@ -479,10 +554,18 @@ def get_geo_records(
             if style_color and not style_color.startswith("#"):
                 style_color = "#" + style_color
 
+            # Use Smarty lat/lon when available and non-zero (more accurate)
+            lat = row.latitude
+            lon = row.longitude
+            if row.smarty_lat and row.smarty_lat != 0:
+                lat = row.smarty_lat
+            if row.smarty_lon and row.smarty_lon != 0:
+                lon = row.smarty_lon
+
             feat = {
                 "id": row.id,
-                "lat": row.latitude,
-                "lon": row.longitude,
+                "lat": lat,
+                "lon": lon,
                 "address": row.raw_address or meta.get("placemark_name", ""),
                 "city": row.city or "",
                 "state": row.state or "",
@@ -495,6 +578,11 @@ def get_geo_records(
                 "folder_path": meta.get("folder_path", ""),
                 "style_color": style_color,
                 "placemark_name": meta.get("placemark_name", ""),
+                # Agent 1 enrichment
+                "canonical_address": row.canonical_address or "",
+                "validation_status": row.validation_status or "",
+                "confidence_score": row.confidence_score,
+                "chosen_provider": row.chosen_provider or "",
             }
             # Parse and include coordinates for polygons and linestrings
             geom_type = meta.get("geometry_type", "")
@@ -556,6 +644,19 @@ def get_record(record_id: int, _current_user: str = Depends(_require_auth)):
         a = session.get(Address, record_id)
         if not a:
             raise HTTPException(status_code=404, detail="Record not found")
+        # Overlay Smarty lat/lon into raw_metadata if Agent 1 has results
+        from sqlalchemy import select as _sel3
+        a1 = session.execute(
+            _sel3(Agent1Result).where(Agent1Result.address_id == record_id)
+        ).scalars().first()
+        meta = dict(a.raw_metadata or {})
+        if a1 and a1.smarty_lat:
+            for k in list(meta.keys()):
+                kl = k.lower().replace(" ", "_")
+                if kl == "network_node_latitude":
+                    meta[k] = a1.smarty_lat
+                elif kl == "network_node_longitude":
+                    meta[k] = a1.smarty_lon
         return RecordResponse(
             id=a.id,
             record_uuid=str(a.record_uuid),
@@ -577,7 +678,7 @@ def get_record(record_id: int, _current_user: str = Depends(_require_auth)):
             source_row_number=a.source_row_number,
             validation_errors=a.validation_errors,
             validation_warnings=a.validation_warnings,
-            raw_metadata=a.raw_metadata,
+            raw_metadata=meta,
             created_at=a.created_at.isoformat(),
         )
     finally:
@@ -902,45 +1003,149 @@ async def start_processing(job_id: str, _current_user: str = Depends(_require_au
 
 
 async def _run_agents(job_id: str, total_records: int):
-    """Simulate agent processing pipeline (replace with real agent calls)."""
+    """Run the real agent pipeline for a job (Agent 1 = Smarty+Melissa address validation)."""
     progress = _agent_progress.get(job_id)
     if not progress:
         return
 
-    for idx, agent_def in enumerate(AGENT_DEFINITIONS):
-        if job_id not in _agent_progress:
-            return  # Job was cancelled
+    # ── Agent 1: Address Validation ──────────────────────────────────────────
+    agent = progress["agents"][0]
+    agent["status"] = "running"
+    agent["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    progress["current_agent_idx"] = 0
 
-        progress["current_agent_idx"] = idx
-        agent = progress["agents"][idx]
-        agent["status"] = "running"
-        agent["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    # Progress callback updates the in-memory dict so the SSE stream shows live %
+    def _progress(done: int, total: int):
+        pct = int((done / total) * 100) if total else 0
+        agent["records_processed"] = done
+        agent["progress"] = pct
+        completed = sum(1 for a in progress["agents"] if a["status"] == "completed")
+        progress["overall_progress"] = int(
+            ((completed + pct / 100) / len(AGENT_DEFINITIONS)) * 100
+        )
 
-        # Simulate processing records in batches
-        batch_size = max(1, total_records // 10)
-        processed = 0
-        while processed < total_records:
-            await asyncio.sleep(0.5)  # Simulate work
-            processed = min(processed + batch_size, total_records)
-            agent["records_processed"] = processed
-            agent["progress"] = int((processed / total_records) * 100)
-            # Update overall progress
-            completed_agents = sum(1 for a in progress["agents"] if a["status"] == "completed")
-            current_progress = agent["progress"] / 100
-            progress["overall_progress"] = int(
-                ((completed_agents + current_progress) / len(AGENT_DEFINITIONS)) * 100
-            )
-
+    try:
+        loop = asyncio.get_event_loop()
+        summary = await loop.run_in_executor(
+            None,
+            lambda: run_agent1_for_job(job_id, progress_callback=_progress)
+        )
         agent["status"] = "completed"
-        agent["progress"] = 100
-        agent["records_processed"] = total_records
-        agent["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        agent["errors"] = []
+        agent["summary"] = summary
+    except Exception as exc:
+        agent["status"] = "failed"
+        agent["errors"] = [str(exc)]
+        progress["status"] = "failed"
+        progress["overall_progress"] = 0
+        return
 
-    # All agents done
+    agent["progress"] = 100
+    agent["records_processed"] = total_records
+    agent["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    # Mark remaining stub agents as instant-completed
+    for idx in range(1, len(AGENT_DEFINITIONS)):
+        a = progress["agents"][idx]
+        a["status"] = "completed"
+        a["progress"] = 100
+        a["records_processed"] = total_records
+        a["started_at"] = agent["completed_at"]
+        a["completed_at"] = agent["completed_at"]
+
     progress["status"] = "completed"
     progress["overall_progress"] = 100
-    progress["output_csv"] = f"/outputs/{job_id}_enriched.csv"
-    progress["output_kmz"] = f"/outputs/{job_id}_output.kmz"
+    progress["output_csv"] = f"/api/jobs/{job_id}/agent1-results?fmt=csv"
+    progress["output_kmz"] = f"/api/export/kmz?job_id={job_id}"
+
+
+# ─── Agent 1 Results endpoint ────────────────────────────────────────────────
+
+@app.get("/api/jobs/{job_id}/agent1-results")
+def get_agent1_results(
+    job_id: str,
+    fmt: str | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=100, ge=1, le=1000),
+    validation_status: str | None = Query(default=None),
+    _current_user: str = Depends(_require_auth),
+):
+    """Return Agent 1 (Smarty+Melissa) validation results for a job.
+
+    fmt=csv → download as CSV
+    validation_status=AUTO_ACCEPT|MANUAL_REVIEW|REJECT → filter
+    """
+    session = get_session_factory()()
+    try:
+        from sqlalchemy import select as _sel
+        q = _sel(Agent1Result).where(Agent1Result.job_id == job_id)
+        if validation_status:
+            q = q.where(Agent1Result.validation_status == validation_status)
+        q = q.order_by(Agent1Result.id)
+
+        total = session.scalar(_sel(func.count()).select_from(
+            _sel(Agent1Result).where(Agent1Result.job_id == job_id).subquery()
+        ))
+
+        all_rows = session.scalars(q).all()
+
+        def _row(r: Agent1Result) -> dict:
+            return {
+                "id":                            r.id,
+                "address_id":                    r.address_id,
+                "raw_address":                   r.raw_address,
+                "canonical_address":             r.canonical_address,
+                "smarty_standardized_address":   r.smarty_standardized_address,
+                "smarty_dpv":                    r.smarty_dpv,
+                "smarty_zip_plus_4":             r.smarty_zip_plus_4,
+                "smarty_vacant":                 r.smarty_vacant,
+                "smarty_record_type":            r.smarty_record_type,
+                "smarty_lat":                    r.smarty_lat,
+                "smarty_lon":                    r.smarty_lon,
+                "melissa_standardized_address":  r.melissa_standardized_address,
+                "melissa_dpv":                   r.melissa_dpv,
+                "melissa_zip_plus_4":            r.melissa_zip_plus_4,
+                "melissa_vacant":                r.melissa_vacant,
+                "melissa_record_type":           r.melissa_record_type,
+                "chosen_standardized_address":   r.chosen_standardized_address,
+                "chosen_provider":               r.chosen_provider,
+                "structure_hint":                r.structure_hint,
+                "confidence_score":              r.confidence_score,
+                "validation_status":             r.validation_status,
+                "exception_reason":              r.exception_reason,
+                "comparison_reason":             r.comparison_reason,
+                "created_at":                    r.created_at.isoformat() if r.created_at else None,
+            }
+
+        if fmt == "csv":
+            rows = [_row(r) for r in all_rows]
+            if not rows:
+                raise HTTPException(status_code=404, detail="No agent1 results for this job")
+            buf = io.StringIO()
+            w = csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
+            w.writeheader()
+            w.writerows(rows)
+            buf.seek(0)
+            return StreamingResponse(
+                iter([buf.getvalue()]),
+                media_type="text/csv",
+                headers={"Content-Disposition": f"attachment; filename=agent1_{job_id}.csv"},
+            )
+
+        rows = [_row(r) for r in all_rows[(page-1)*page_size : page*page_size]]
+        return {
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "results": rows,
+            "summary": {
+                "auto_accept":   sum(1 for r in all_rows if r.validation_status == "AUTO_ACCEPT"),
+                "manual_review": sum(1 for r in all_rows if r.validation_status == "MANUAL_REVIEW"),
+                "reject":        sum(1 for r in all_rows if r.validation_status == "REJECT"),
+            }
+        }
+    finally:
+        session.close()
 
 
 @app.get("/api/jobs/{job_id}/progress")
@@ -1377,10 +1582,24 @@ def export_merged_csv(
                     all_keys.update(agents[aname].keys())
             agent_col_keys[aname] = sorted(all_keys)
 
+        # Load Agent 1 results indexed by address_id
+        agent1_data: dict[int, Agent1Result] = {
+            r.address_id: r
+            for r in session.scalars(
+                select(Agent1Result).where(Agent1Result.job_id == job_id)
+            ).all()
+        }
+
         base_cols = [
             "id", "raw_address", "city", "state", "zip_code",
             "latitude", "longitude", "network_node", "terminal_id",
             "address_id", "source_file", "source_row_number",
+            # Agent 1 validation enrichment columns
+            "agent1_canonical_address", "agent1_validation_status",
+            "agent1_confidence_score", "agent1_chosen_provider",
+            "agent1_smarty_lat", "agent1_smarty_lon",
+            "agent1_smarty_standardized", "agent1_smarty_dpv",
+            "agent1_exception_reason",
         ]
         meta_keys: list[str] = []
         if addresses:
@@ -1399,6 +1618,7 @@ def export_merged_csv(
 
         for addr in addresses:
             meta = addr.raw_metadata or {}
+            a1 = agent1_data.get(addr.id)
             row: dict[str, Any] = {
                 "id": addr.id,
                 "raw_address": addr.raw_address or "",
@@ -1412,6 +1632,16 @@ def export_merged_csv(
                 "address_id": addr.address_id or "",
                 "source_file": addr.source_file or "",
                 "source_row_number": addr.source_row_number or "",
+                # Agent 1 columns
+                "agent1_canonical_address": a1.canonical_address if a1 else "",
+                "agent1_validation_status": a1.validation_status if a1 else "",
+                "agent1_confidence_score": a1.confidence_score if a1 else "",
+                "agent1_chosen_provider": a1.chosen_provider if a1 else "",
+                "agent1_smarty_lat": a1.smarty_lat if a1 else "",
+                "agent1_smarty_lon": a1.smarty_lon if a1 else "",
+                "agent1_smarty_standardized": a1.smarty_standardized_address if a1 else "",
+                "agent1_smarty_dpv": a1.smarty_dpv if a1 else "",
+                "agent1_exception_reason": a1.exception_reason if a1 else "",
             }
             for k in meta_keys:
                 row[k] = meta.get(k, "")
@@ -1425,6 +1655,230 @@ def export_merged_csv(
         return StreamingResponse(
             iter([output.getvalue()]),
             media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={fname}"},
+        )
+    finally:
+        session.close()
+
+
+# ─── Export: Excel with Agent-1 full output written back ──────────────────────
+
+@app.get("/api/export/excel")
+def export_excel(
+    job_id: str,
+    _current_user: str = Depends(_require_auth),
+    _t: str | None = Query(default=None),
+):
+    """
+    Download an Excel file with two sheets:
+      Sheet 1 – all original columns with network_node_latitude/longitude
+                 overwritten from Smarty, plus all Agent 1 output columns
+                 appended at the right (blue header, yellow fill for validated).
+      Sheet 2 – full Agent 1 results table (one row per address).
+    """
+    session = get_session_factory()()
+    try:
+        addresses = session.scalars(
+            select(Address).where(Address.job_id == job_id).order_by(Address.id.asc())
+        ).all()
+        if not addresses:
+            raise HTTPException(status_code=404, detail="No records found for this job")
+
+        agent1_map: dict[int, Agent1Result] = {
+            r.address_id: r
+            for r in session.scalars(
+                select(Agent1Result).where(Agent1Result.job_id == job_id)
+            ).all()
+        }
+
+        # ── Styles ────────────────────────────────────────────────────────────
+        from openpyxl.styles import Alignment, Border, Side
+        thin = Side(style="thin", color="CCCCCC")
+        thin_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+        dark_fill   = PatternFill(start_color="1F3864", end_color="1F3864", fill_type="solid")  # original header
+        dark_font   = Font(bold=True, color="FFFFFF")
+        blue_fill   = PatternFill(start_color="1E4D8C", end_color="1E4D8C", fill_type="solid")  # agent1 header
+        blue_font   = Font(bold=True, color="FFFFFF")
+        green_fill  = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")  # updated coords
+        green_font  = Font(bold=True, color="276221")
+        yellow_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")  # agent1 data cells
+        yellow_font = Font(color="9C6500")
+        red_fill    = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")  # REJECT
+        red_font    = Font(bold=True, color="9C0006")
+        accept_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")  # AUTO_ACCEPT
+        accept_font = Font(bold=True, color="276221")
+        review_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")  # MANUAL_REVIEW
+        review_font = Font(bold=True, color="9C6500")
+
+        LAT_KEYS = {"network_node_latitude", "network node latitude"}
+        LON_KEYS = {"network_node_longitude", "network node longitude"}
+
+        # Agent 1 columns to append (label → attribute on Agent1Result)
+        A1_COLS = [
+            ("Agent1: Validation Status",       "validation_status"),
+            ("Agent1: Confidence Score",         "confidence_score"),
+            ("Agent1: Canonical Address",        "canonical_address"),
+            ("Agent1: Chosen Provider",          "chosen_provider"),
+            ("Agent1: Structure Hint",           "structure_hint"),
+            ("Agent1: Smarty Latitude",          "smarty_lat"),
+            ("Agent1: Smarty Longitude",         "smarty_lon"),
+            ("Agent1: Smarty Standardized",      "smarty_standardized_address"),
+            ("Agent1: Smarty DPV Match",         "smarty_dpv"),
+            ("Agent1: Smarty ZIP+4",             "smarty_zip_plus_4"),
+            ("Agent1: Smarty Vacant",            "smarty_vacant"),
+            ("Agent1: Smarty Record Type",       "smarty_record_type"),
+            ("Agent1: Melissa Standardized",     "melissa_standardized_address"),
+            ("Agent1: Melissa DPV Match",        "melissa_dpv"),
+            ("Agent1: Melissa ZIP+4",            "melissa_zip_plus_4"),
+            ("Agent1: Melissa Vacant",           "melissa_vacant"),
+            ("Agent1: Melissa Record Type",      "melissa_record_type"),
+            ("Agent1: Comparison Reason",        "comparison_reason"),
+            ("Agent1: Exception Reason",         "exception_reason"),
+        ]
+
+        # ── Sheet 1: enriched original data ───────────────────────────────────
+        first_meta: dict = addresses[0].raw_metadata or {}
+        meta_keys = [k for k in first_meta if k not in ("agent_outputs", "agent_results", "coordinates")]
+
+        base_cols = [
+            "id", "raw_address", "city", "state", "zip_code",
+            "latitude", "longitude", "network_node", "terminal_id",
+            "address_id", "source_file", "source_row_number",
+        ]
+        all_orig_cols = base_cols + meta_keys
+        all_cols = all_orig_cols + [label for label, _ in A1_COLS]
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "FTTH Data + Agent1"
+        ws.freeze_panes = "A2"
+
+        col_idx = {c: i + 1 for i, c in enumerate(all_cols)}
+        orig_count = len(all_orig_cols)
+
+        # Header row
+        for col_name, ci in col_idx.items():
+            cell = ws.cell(row=1, column=ci, value=col_name)
+            if ci <= orig_count:
+                cell.fill = dark_fill
+                cell.font = dark_font
+            else:
+                cell.fill = blue_fill
+                cell.font = blue_font
+            cell.alignment = Alignment(wrap_text=False)
+
+        # Data rows
+        for row_num, addr in enumerate(addresses, start=2):
+            meta = addr.raw_metadata or {}
+            a1 = agent1_map.get(addr.id)
+            smarty_lat = a1.smarty_lat if a1 and a1.smarty_lat else None
+            smarty_lon = a1.smarty_lon if a1 and a1.smarty_lon else None
+
+            base_vals = {
+                "id": addr.id,
+                "raw_address": addr.raw_address or "",
+                "city": addr.city or "",
+                "state": addr.state or "",
+                "zip_code": addr.zip_code or "",
+                "latitude": addr.latitude or "",
+                "longitude": addr.longitude or "",
+                "network_node": addr.network_node or "",
+                "terminal_id": addr.terminal_id or "",
+                "address_id": addr.address_id or "",
+                "source_file": addr.source_file or "",
+                "source_row_number": addr.source_row_number or "",
+            }
+
+            # Write original columns
+            for col_name, ci in col_idx.items():
+                if ci > orig_count:
+                    break
+                val = base_vals.get(col_name, meta.get(col_name, ""))
+                col_lower = col_name.lower().replace(" ", "_")
+                updated = False
+                if col_lower in LAT_KEYS and smarty_lat is not None:
+                    val = smarty_lat
+                    updated = True
+                elif col_lower in LON_KEYS and smarty_lon is not None:
+                    val = smarty_lon
+                    updated = True
+                cell = ws.cell(row=row_num, column=ci, value=val)
+                if updated:
+                    cell.fill = green_fill
+                    cell.font = green_font
+
+            # Write agent1 columns
+            for label, attr in A1_COLS:
+                ci = col_idx[label]
+                val = getattr(a1, attr, "") if a1 else ""
+                if val is None:
+                    val = ""
+                cell = ws.cell(row=row_num, column=ci, value=val)
+                # Color status column distinctly
+                if attr == "validation_status":
+                    if val == "AUTO_ACCEPT":
+                        cell.fill = accept_fill; cell.font = accept_font
+                    elif val == "REJECT":
+                        cell.fill = red_fill; cell.font = red_font
+                    elif val == "MANUAL_REVIEW":
+                        cell.fill = review_fill; cell.font = review_font
+                elif a1:
+                    cell.fill = yellow_fill; cell.font = yellow_font
+
+        # Auto-size
+        for col_cells in ws.columns:
+            max_len = max((len(str(c.value)) if c.value else 0) for c in col_cells)
+            ws.column_dimensions[col_cells[0].column_letter].width = min(max_len + 2, 45)
+
+        # ── Sheet 2: Agent 1 full results ────────────────────────────────────
+        ws2 = wb.create_sheet(title="Agent1 Validation")
+        ws2.freeze_panes = "A2"
+
+        a1_sheet_cols = [
+            "address_id", "raw_address",
+            "validation_status", "confidence_score", "chosen_provider", "structure_hint",
+            "canonical_address",
+            "smarty_standardized_address", "smarty_lat", "smarty_lon",
+            "smarty_dpv", "smarty_zip_plus_4", "smarty_vacant", "smarty_record_type",
+            "melissa_standardized_address", "melissa_dpv", "melissa_zip_plus_4",
+            "melissa_vacant", "melissa_record_type",
+            "comparison_reason", "exception_reason",
+        ]
+
+        for ci, col in enumerate(a1_sheet_cols, start=1):
+            cell = ws2.cell(row=1, column=ci, value=col)
+            cell.fill = blue_fill; cell.font = blue_font
+
+        for row_num, addr in enumerate(addresses, start=2):
+            a1 = agent1_map.get(addr.id)
+            for ci, attr in enumerate(a1_sheet_cols, start=1):
+                if attr == "address_id":
+                    val = addr.id
+                elif attr == "raw_address":
+                    val = addr.raw_address or ""
+                else:
+                    val = (getattr(a1, attr, "") or "") if a1 else ""
+                cell = ws2.cell(row=row_num, column=ci, value=val)
+                if attr == "validation_status":
+                    if val == "AUTO_ACCEPT":
+                        cell.fill = accept_fill; cell.font = accept_font
+                    elif val == "REJECT":
+                        cell.fill = red_fill; cell.font = red_font
+                    elif val == "MANUAL_REVIEW":
+                        cell.fill = review_fill; cell.font = review_font
+
+        for col_cells in ws2.columns:
+            max_len = max((len(str(c.value)) if c.value else 0) for c in col_cells)
+            ws2.column_dimensions[col_cells[0].column_letter].width = min(max_len + 2, 45)
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        fname = f"ftth_validated_{job_id[:8]}.xlsx"
+        return StreamingResponse(
+            iter([buf.getvalue()]),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers={"Content-Disposition": f"attachment; filename={fname}"},
         )
     finally:

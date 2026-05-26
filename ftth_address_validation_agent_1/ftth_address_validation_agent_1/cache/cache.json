@@ -1,0 +1,22 @@
+{
+  "212wildspringctlexingtonsc29072": {
+    "provider": "smarty",
+    "score": 90,
+    "standardized_address": "212 Wild Spring Ct Lexington SC 29072-7179"
+  },
+  "99999fakestreetlexingtonsc29072": {
+    "provider": "smarty",
+    "score": 20,
+    "standardized_address": null
+  },
+  "137freshspringwaylexingtonsc29072": {
+    "provider": "smarty",
+    "score": 90,
+    "standardized_address": "137 Fresh Spring Way Lexington SC 29072-7152"
+  },
+  "121wildspringrdlexingtonsc29072": {
+    "provider": "smarty",
+    "score": 90,
+    "standardized_address": "121 Wild Spring Rd Lexington SC 29072-7120"
+  }
+}
